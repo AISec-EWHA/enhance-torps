@@ -39,33 +39,33 @@
 
 
 
-BASE_DIR=/home/ajohnson/research/torps.git
+BASE_DIR=/scratch/enhance_pairwise/torps
 
-NUM_PROCESSES=20
+NUM_PROCESSES=4
 DATE_RANGE=$1
-NSF_TYPE=$2
 OUTPUT="relay-adv"
-ADV_GUARD_BW=$3
-ADV_EXIT_BW=$4
+ADV_GUARD_BW=$2
+ADV_EXIT_BW=$3
 ADV_TIME=0
 NUM_ADV_GUARDS=1
 NUM_ADV_EXITS=1
 USERMODEL=typical
-NUM_SAMPLES=5000
+NUM_SAMPLES=100
 TRACEFILE=$BASE_DIR/in/users2-processed.traces.pickle
 LOGLEVEL="INFO"
 PATH_ALG=tor
 
 EXP_NAME=$USERMODEL.$DATE_RANGE.$ADV_GUARD_BW-$ADV_EXIT_BW-$ADV_TIM-adv
-NSF_DIR=$BASE_DIR/out/network-state/$NSF_TYPE/ns-$DATE_RANGE
+NSF_DIR=$BASE_DIR/out/network-state-$DATE_RANGE
 
 # make output directory
 OUT_DIR=$BASE_DIR/out/simulate/$EXP_NAME
 mkdir -p $OUT_DIR
- 
+exec > >(tee $BASE_DIR/out/logs/guard_exit_bw.$EXP_NAME.txt) 2>&1
+
 i=1
 while [ $i -le $NUM_PROCESSES ]
 do
-    (time pypy pathsim.py simulate --nsf_dir $NSF_DIR --num_samples $NUM_SAMPLES --trace_file $TRACEFILE --user_model $USERMODEL --format $OUTPUT --adv_guard_cons_bw $ADV_GUARD_BW --adv_exit_cons_bw $ADV_EXIT_BW --adv_time $ADV_TIME --num_adv_guards $NUM_ADV_GUARDS --num_adv_exits $NUM_ADV_EXITS --loglevel $LOGLEVEL $PATH_ALG) 2> $OUT_DIR/simulate.$EXP_NAME.$NUM_SAMPLES-samples.$i.time 1> $OUT_DIR/simulate.$EXP_NAME.$NUM_SAMPLES-samples.$i.out &
+    (time python pathsim.py simulate --nsf_dir $NSF_DIR --num_samples $NUM_SAMPLES --trace_file $TRACEFILE --user_model $USERMODEL --format $OUTPUT --adv_guard_cons_bw $ADV_GUARD_BW --adv_exit_cons_bw $ADV_EXIT_BW --adv_time $ADV_TIME --num_adv_guards $NUM_ADV_GUARDS --num_adv_exits $NUM_ADV_EXITS --loglevel $LOGLEVEL $PATH_ALG) 2> $OUT_DIR/simulate.$EXP_NAME.$NUM_SAMPLES-samples.$i.time 1> $OUT_DIR/simulate.$EXP_NAME.$NUM_SAMPLES-samples.$i.out &
     i=$(($i+1))
 done
