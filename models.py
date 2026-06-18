@@ -18,6 +18,13 @@ where each line represents a new stream, TIME is the stream creation timestamp i
     def from_pickle(filename):
         with open(filename, 'rb') as f: return pickle.load(f)
 
+    @staticmethod
+    def from_dict(trace_dict):
+        """Create a UserTraces from a plain dict {key: [(seconds, ip, port), ...]}."""
+        ut = UserTraces.__new__(UserTraces)
+        ut.trace = trace_dict
+        return ut
+
     def __init__(self, facebookf, gmailgchatf, gcalgdocsf, websearchf, ircf, bittorrentf):
         self.trace = {}
         for (key, filename) in [("facebook",facebookf) , ("gmailgchat",gmailgchatf), ("gcalgdocs",gcalgdocsf), ("websearch",websearchf), ("irc",ircf), ("bittorrent",bittorrentf)]:
@@ -92,6 +99,16 @@ We collected session traces of approximately 20 minutes for each usage class. We
             sessionend = self.schedule_session("typical", usertraces.trace["websearch"], t4+day*numdays)
             self.schedule_session("typical", usertraces.trace["websearch"], sessionend)
         self.schedule["typical"].sort(key = lambda x: x[0])
+
+        # hourly schedule for any custom keys not in the standard set
+        standard_keys = {"facebook", "gmailgchat", "gcalgdocs", "websearch",
+                         "irc", "bittorrent", "typical", "best", "worst"}
+        for key in usertraces.trace:
+            if key not in standard_keys:
+                self.schedule[key] = []
+                trace = usertraces.trace[key]
+                for hour in range(0, 7 * 24):
+                    self.schedule_session(key, trace, hour * 3600)
 
         # best/worst case models
         self.schedule["best"] = [] # smart sarah
