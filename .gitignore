@@ -5,3 +5,5 @@
 *.lo
 *.pyc
 out/
+in/
+res/

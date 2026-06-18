@@ -1599,6 +1599,10 @@ def get_user_model(start_time, end_time, tracefilename=None,
         str_ip = '74.125.131.105' # www.google.com
         for t in xrange(start_time, end_time, http_request_wait):
             streams.append({'time':t,'type':'connect','ip':str_ip,'port':80})
+    elif (re.match('all',session)):
+        ut = UserTraces.from_pickle(tracefilename)
+        um = UserModel(ut, start_time, end_time)
+        return {key: um.get_streams(key) for key in um.model.keys()}
     else:
         ut = UserTraces.from_pickle(tracefilename)
         um = UserModel(ut, start_time, end_time)
@@ -1845,8 +1849,13 @@ pathsim, and pickle it. The pickled object is input to the simulate command')
         callbacks.start()
 
         # simulate circuit creation and stream assignment
-        create_circuits(network_states, streams, args.num_samples, congmodel,
-            pdelmodel, callbacks)
+        if isinstance(streams, dict):
+            for model_name, model_streams in streams.items():
+                create_circuits(network_states, model_streams, args.num_samples,
+                    congmodel, pdelmodel, callbacks)
+        else:
+            create_circuits(network_states, streams, args.num_samples, congmodel,
+                pdelmodel, callbacks)
     elif (args.subparser == 'concattraces'):
         ut = UserTraces(args.facebook_filename, args.gmailchat_filename,
             args.gcalgdocs_filename, args.websearch_filename,
