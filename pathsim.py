@@ -1418,7 +1418,7 @@ def create_circuits(network_states, streams, num_samples, congmodel,
             cons_bw_weights = network_state.cons_bw_weights
             cons_bwweightscale = network_state.cons_bwweightscale
             cons_rel_stats = network_state.cons_rel_stats
-            hibernating_statuses = network_state.hibernating_statuses
+            hibernating_statuses = list(network_state.hibernating_statuses)
             new_descriptors = network_state.descriptors
 
             # clear hibernating status to ensure updates come from ns_file
