@@ -61,44 +61,47 @@ We collected session traces of approximately 20 minutes for each usage class. We
         self.schedule = {}
         day = 86400
 
-        # first set up the weekly schedule for each session type
-        for key in ["facebook", "gmailgchat", "gcalgdocs", "websearch"]:
-            self.schedule[key] = []
-            trace = usertraces.trace[key]
-            monmorn, monnight = 109800, 151200
-            for (morning, night) in [(monmorn, monnight), (monmorn+day, monnight+day), (monmorn+day*2, monnight+day*2), (monmorn+day*3, monnight+day*3), (monmorn+day*4, monnight+day*4)]:
-                sessionend = self.schedule_session(key, trace, morning) # 0630
-                sessionend = self.schedule_session(key, trace, night) # 1800
-                sessionend = self.schedule_session(key, trace, sessionend) # after above session
-                sessionend = self.schedule_session(key, trace, sessionend) # after above session
-        for key in ["irc"]:
-            self.schedule[key] = []
-            trace = usertraces.trace[key]
-            monmorn = 115200
-            for morning in [monmorn, monmorn+day, monmorn+day*2, monmorn+day*3, monmorn+day*4]:
-                sessionend = self.schedule_session(key, trace, morning)
-                for i in xrange(26):
-                    sessionend = self.schedule_session(key, trace, sessionend)
-        for key in ["bittorrent"]:
-            self.schedule[key] = []
-            trace = usertraces.trace[key]
-            sunmorn = 0
-            for morning in [sunmorn, sunmorn+day*6]:
-                sessionend = self.schedule_session(key, trace, morning)
-                for i in xrange(17):
-                    sessionend = self.schedule_session(key, trace, sessionend)
+        has_standard = all(k in usertraces.trace for k in ["facebook", "gmailgchat", "gcalgdocs", "websearch", "irc", "bittorrent"])
 
-        # construct new model of typical usage                    
-        self.schedule["typical"] = []
-        t1, t2, t3, t4 = 32400, 43200, 54000, 64800 # sunday, 9,12,3,6
-        for numdays in [0,1,2,3,4,5,6]:
-            self.schedule_session("typical", usertraces.trace["gmailgchat"], t1+day*numdays)
-            self.schedule_session("typical", usertraces.trace["gcalgdocs"], t2+day*numdays)
-            self.schedule_session("typical", usertraces.trace["facebook"], t3+day*numdays)
-            # now 2 consecutive web sessions
-            sessionend = self.schedule_session("typical", usertraces.trace["websearch"], t4+day*numdays)
-            self.schedule_session("typical", usertraces.trace["websearch"], sessionend)
-        self.schedule["typical"].sort(key = lambda x: x[0])
+        if has_standard:
+            # first set up the weekly schedule for each session type
+            for key in ["facebook", "gmailgchat", "gcalgdocs", "websearch"]:
+                self.schedule[key] = []
+                trace = usertraces.trace[key]
+                monmorn, monnight = 109800, 151200
+                for (morning, night) in [(monmorn, monnight), (monmorn+day, monnight+day), (monmorn+day*2, monnight+day*2), (monmorn+day*3, monnight+day*3), (monmorn+day*4, monnight+day*4)]:
+                    sessionend = self.schedule_session(key, trace, morning) # 0630
+                    sessionend = self.schedule_session(key, trace, night) # 1800
+                    sessionend = self.schedule_session(key, trace, sessionend) # after above session
+                    sessionend = self.schedule_session(key, trace, sessionend) # after above session
+            for key in ["irc"]:
+                self.schedule[key] = []
+                trace = usertraces.trace[key]
+                monmorn = 115200
+                for morning in [monmorn, monmorn+day, monmorn+day*2, monmorn+day*3, monmorn+day*4]:
+                    sessionend = self.schedule_session(key, trace, morning)
+                    for i in xrange(26):
+                        sessionend = self.schedule_session(key, trace, sessionend)
+            for key in ["bittorrent"]:
+                self.schedule[key] = []
+                trace = usertraces.trace[key]
+                sunmorn = 0
+                for morning in [sunmorn, sunmorn+day*6]:
+                    sessionend = self.schedule_session(key, trace, morning)
+                    for i in xrange(17):
+                        sessionend = self.schedule_session(key, trace, sessionend)
+
+            # construct new model of typical usage
+            self.schedule["typical"] = []
+            t1, t2, t3, t4 = 32400, 43200, 54000, 64800 # sunday, 9,12,3,6
+            for numdays in [0,1,2,3,4,5,6]:
+                self.schedule_session("typical", usertraces.trace["gmailgchat"], t1+day*numdays)
+                self.schedule_session("typical", usertraces.trace["gcalgdocs"], t2+day*numdays)
+                self.schedule_session("typical", usertraces.trace["facebook"], t3+day*numdays)
+                # now 2 consecutive web sessions
+                sessionend = self.schedule_session("typical", usertraces.trace["websearch"], t4+day*numdays)
+                self.schedule_session("typical", usertraces.trace["websearch"], sessionend)
+            self.schedule["typical"].sort(key = lambda x: x[0])
 
         # hourly schedule for any custom keys not in the standard set
         standard_keys = {"facebook", "gmailgchat", "gcalgdocs", "websearch",
@@ -111,11 +114,12 @@ We collected session traces of approximately 20 minutes for each usage class. We
                     self.schedule_session(key, trace, hour * 3600)
 
         # best/worst case models
-        self.schedule["best"] = [] # smart sarah
-        self.schedule["worst"] = [] # dumb dan
-        for (seconds, ip, port) in self.schedule["typical"]:
-            self.schedule["best"].append((seconds, ip, 443))
-            self.schedule["worst"].append((seconds, ip, 6523)) # 6523 is for gobby: a free collaborative text editor
+        if has_standard:
+            self.schedule["best"] = [] # smart sarah
+            self.schedule["worst"] = [] # dumb dan
+            for (seconds, ip, port) in self.schedule["typical"]:
+                self.schedule["best"].append((seconds, ip, 443))
+                self.schedule["worst"].append((seconds, ip, 6523)) # 6523 is for gobby: a free collaborative text editor
 
         # then build the model during the requested interval
         startd = datetime.datetime.fromtimestamp(starttime)
