@@ -1850,8 +1850,9 @@ pathsim, and pickle it. The pickled object is input to the simulate command')
 
         # simulate circuit creation and stream assignment
         if isinstance(streams, dict):
+            network_states_list = list(network_states)
             for model_name, model_streams in streams.items():
-                create_circuits(network_states, model_streams, args.num_samples,
+                create_circuits(iter(network_states_list), model_streams, args.num_samples,
                     congmodel, pdelmodel, callbacks)
         else:
             create_circuits(network_states, streams, args.num_samples, congmodel,
