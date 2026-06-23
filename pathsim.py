@@ -1418,7 +1418,7 @@ def create_circuits(network_states, streams, num_samples, congmodel,
             cons_bw_weights = network_state.cons_bw_weights
             cons_bwweightscale = network_state.cons_bwweightscale
             cons_rel_stats = network_state.cons_rel_stats
-            hibernating_statuses = network_state.hibernating_statuses
+            hibernating_statuses = list(network_state.hibernating_statuses)
             new_descriptors = network_state.descriptors
 
             # clear hibernating status to ensure updates come from ns_file
@@ -1850,8 +1850,9 @@ pathsim, and pickle it. The pickled object is input to the simulate command')
 
         # simulate circuit creation and stream assignment
         if isinstance(streams, dict):
+            network_states_list = list(network_states)
             for model_name, model_streams in streams.items():
-                create_circuits(network_states, model_streams, args.num_samples,
+                create_circuits(iter(network_states_list), model_streams, args.num_samples,
                     congmodel, pdelmodel, callbacks)
         else:
             create_circuits(network_states, streams, args.num_samples, congmodel,
