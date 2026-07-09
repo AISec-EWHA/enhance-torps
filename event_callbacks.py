@@ -29,9 +29,9 @@ class PrintStreamAssignments(object):
         elif (self.format == 'relay-adv'):
             self.file.write('Sample\tTimestamp\tCompromise Code\n')
         elif (self.format == 'network-adv'):
-            self.file.write('Sample\tTimestamp\tGuard ip\tExit IP\tDestination IP\n')
+            self.file.write('Sample\tTimestamp\tGuard Fingerprint\tExit Fingerprint\tDestination IP\n')
         else:
-            self.file.write('Sample\tTimestamp\tGuard IP\tMiddle IP\tExit IP\tDestination IP\n')
+            self.file.write('Sample\tTimestamp\tGuard Fingerprint\tMiddle Fingerprint\tExit Fingerprint\tDestination IP\n')
 
     def set_network_state(self, cons_valid_after, cons_fresh_until, cons_bw_weights,
         cons_bwweightscale, cons_rel_stats, descriptors):
@@ -56,9 +56,9 @@ class PrintStreamAssignments(object):
             else:
                 self.file.write('{0}\t{1}\n'.format(self.sample_id, stream['time']))
         else:
-            guard_ip = self.descriptors[circuit['path'][0]].address
-            middle_ip = self.descriptors[circuit['path'][1]].address
-            exit_ip = self.descriptors[circuit['path'][2]].address
+            guard_fp = circuit['path'][0]
+            middle_fp = circuit['path'][1]
+            exit_fp = circuit['path'][2]
             if (stream['type'] == 'connect'):
                 dest_ip = stream['ip']
             elif (stream['type'] == 'resolve'):
@@ -93,10 +93,10 @@ class PrintStreamAssignments(object):
                     compromise_code))
             elif (self.format == 'network-adv'):
                 self.file.write('{0}\t{1}\t{2}\t{3}\t{4}\n'.format(self.sample_id, stream['time'],
-                    guard_ip, exit_ip, dest_ip))
+                    guard_fp, exit_fp, dest_ip))
             else:
                 self.file.write('{0}\t{1}\t{2}\t{3}\t{4}\t{5}\n'.format(self.sample_id,
-                    stream['time'], guard_ip, middle_ip, exit_ip, dest_ip))
+                    stream['time'], guard_fp, middle_fp, exit_fp, dest_ip))
 ######
 
 ### Print relay compromised codes of stream assignments, compromise from input adv relays. ###
