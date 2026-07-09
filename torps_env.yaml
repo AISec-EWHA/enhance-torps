@@ -1,0 +1,12 @@
+0name: torps
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=2.7.15
+  - pip=20.1.1
+  - setuptools=44.0.0
+  - wheel=0.37.1
+  - openssl=1.1.1w
+  - pip:
+      - stem==1.8.2
