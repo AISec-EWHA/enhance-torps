@@ -17,8 +17,13 @@ class AdversaryInsertion(object):
             num_str = str(i+1)
             fingerprint = '0' * (40-len(num_str)) + num_str
             nickname = 'BadGuyGuard' + num_str
+            # Added V2Dir flag (reflects the B2 patch - guard eligibility
+            # now requires V2Dir, so an attacker relay also needs to act
+            # as a directory cache to enter the SAMPLED pool. Running a
+            # directory cache is low-cost in practice, so there's no
+            # reason an attacker wouldn't support it.)
             flags = [Flag.FAST, Flag.GUARD, Flag.RUNNING, Flag.STABLE,
-                Flag.VALID]
+                Flag.VALID, Flag.V2DIR]
             self.adv_relays[fingerprint] = pathsim.RouterStatusEntry(fingerprint,
                 nickname, flags, bandwidth)
             
@@ -40,6 +45,12 @@ class AdversaryInsertion(object):
             num_str = str(i+1)
             fingerprint = 'F' * (40-len(num_str)) + num_str
             nickname = 'BadGuyExit' + num_str
+            # Note: V2Dir isn't required for exit eligibility (that's a
+            # guard-only requirement). However, in the weight calculation
+            # (A2), a V2Dir node gets the Web multiplier - so if you want
+            # to model an "attacker also runs the exit as a directory
+            # cache to boost its weight" scenario, it can be added here
+            # too. Left out by default, to be conservative.
             flags = [Flag.FAST, Flag.EXIT, Flag.RUNNING, Flag.STABLE,
                 Flag.VALID]
             self.adv_relays[fingerprint] = pathsim.RouterStatusEntry(fingerprint,
@@ -63,6 +74,23 @@ class AdversaryInsertion(object):
         E the total bandwidth for Exit-flagged nodes
         D the total bandwidth for Guard+Exit-flagged nodes
         T = G+M+E+D
+
+        [#14] Ports update_total_bandwidth_weights() from dirvote.c
+        exactly, including guardfraction blending (confirmed against the
+        real source - an earlier assessment based only on an academic
+        paper's simplified formula wrongly concluded this wasn't needed;
+        the real dirauth code does apply it). Per Proposal 236: a guard
+        relay N with guard visibility fraction F and bandwidth B is
+        added as G' = G + F*B, M' = M + (1-F)*B (or D'/E' if it's also
+        an exit) - NOT simply added wholesale to G or D as the previous
+        version of this function did.
+
+        Note: T only accumulates the F*B (or full B if no guardfraction)
+        portion, exactly mirroring the real source's "*T += default_bandwidth"
+        - the (1-F)*B portion added to M/E is NOT also added to T. This
+        looks like it could make T inconsistent with G+M+E+D, but it's
+        exactly what the real dirvote.c code does, so we match it for
+        fidelity rather than "fixing" what might look like an inconsistency.
         """
 
         # Set total weights based on flags. Note that the valid is not considered for weights
@@ -74,13 +102,30 @@ class AdversaryInsertion(object):
             is_guard = Flag.GUARD in rel_stat.flags
             is_exit = (Flag.EXIT in rel_stat.flags) and (Flag.BADEXIT not in rel_stat.flags)
 
-            T += rel_stat.bandwidth            
-            if (is_guard and not is_exit):
-                G += rel_stat.bandwidth
+            # [#14] guardfraction blending, matching guard_get_guardfraction_bandwidth()
+            # in entrynodes.c. rel_stat.guardfraction is already normalized to
+            # [0,1] (see parse_guardfraction() in process_consensuses.py),
+            # unlike the raw 0-100 guardfraction_percentage used in the C code.
+            default_bandwidth = rel_stat.bandwidth
+            guardfraction_bandwidth = 0
+            guardfraction = getattr(rel_stat, 'guardfraction', None)
+            has_guardfraction = (guardfraction is not None) and is_guard
+            if has_guardfraction:
+                guard_bw = int(round(guardfraction * rel_stat.bandwidth))
+                default_bandwidth = guard_bw
+                guardfraction_bandwidth = rel_stat.bandwidth - guard_bw
+
+            T += default_bandwidth
+            if (is_guard and is_exit):
+                D += default_bandwidth
+                if has_guardfraction:
+                    E += guardfraction_bandwidth
             elif (is_exit and not is_guard):
-                E += rel_stat.bandwidth
-            elif (is_guard and is_exit):
-                D += rel_stat.bandwidth
+                E += default_bandwidth
+            elif (is_guard and not is_exit):
+                G += default_bandwidth
+                if has_guardfraction:
+                    M += guardfraction_bandwidth
             else:
                 M += rel_stat.bandwidth            
 
@@ -342,6 +387,13 @@ class RaiseGuardConsBWThreshold(object):
                 if (rel_stat.bandwidth < self.guard_bw_threshold):
                     num_guard_flags_removed += 1
                     rel_stat.flags = filter(lambda x: x != Flag.GUARD, rel_stat.flags)
+                    # Removing the Guard flag makes guardfraction
+                    # meaningless too, so reset it as well (for data
+                    # consistency; the A3 blending logic would treat this
+                    # node as a different category anyway once Flag.GUARD
+                    # is gone, but resetting explicitly is safer)
+                    if hasattr(rel_stat, 'guardfraction'):
+                        rel_stat.guardfraction = None
         if self.testing:
             print('Removed {} guard flags out of {}'.format(num_guard_flags_removed,
                 num_guard_flags))

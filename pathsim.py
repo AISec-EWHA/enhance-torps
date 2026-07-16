@@ -1,6 +1,7 @@
 import datetime
 import os
 import os.path
+import socket
 from stem import Flag
 from stem.exit_policy import ExitPolicy
 from random import random, randint, choice
@@ -15,6 +16,7 @@ import process_consensuses
 import re
 import network_modifiers
 import event_callbacks
+import guard_selection_271
 import importlib
 import logging
 
@@ -65,7 +67,25 @@ class TorOptions:
     # number of times to attempt to find circuit with at least one NTor hop
     # from #define MAX_POPULATE_ATTEMPTS 32 in circuicbuild.c
     max_populate_attempts = 32
-    
+
+    # [B6] Conflux (Proposal 329) consensus parameters, confirmed against
+    # the real conflux_params.c source.
+    cfx_enabled = True                   # cfx_enabled, default 1
+    cfx_num_legs_set = 2                 # cfx_num_legs_set, default 2
+    cfx_max_prebuilt_set = 3             # cfx_max_prebuilt_set, default 3
+    # cfx_low_exit_threshold: spec-documented default is 60% (6000/10000),
+    # but a real live consensus we inspected (2026-05-28) had this
+    # overridden to 50% (5000/10000) - use the observed live value here
+    # since it reflects actual current network behavior rather than the
+    # untouched spec default. Re-check against a current consensus if
+    # simulating a different period.
+    cfx_low_exit_threshold = 0.50
+    # Maximum number of times to retry building a leg before giving up
+    # (cfx_max_unlinked_leg_retry, default 3) - not used by our simplified
+    # model, which just retries hibernating nodes like create_circuit()
+    # already does; kept here for reference/future use.
+    cfx_max_unlinked_leg_retry = 3
+
     
 class NetworkState:
     """Contains Tor network state in a consensus period needed to run
@@ -87,11 +107,36 @@ class RouterStatusEntry:
     Represents a relay entry in a consensus document.
     Slim version of stem.descriptor.router_status_entry.RouterStatusEntry.
     """
-    def __init__(self, fingerprint, nickname, flags, bandwidth):
+    def __init__(self, fingerprint, nickname, flags, bandwidth,
+        guardfraction=None, family_ids=None, supports_conflux=False):
         self.fingerprint = fingerprint
         self.nickname = nickname
         self.flags = flags
         self.bandwidth = bandwidth
+        # F in [0,1]: fraction of time this relay has had the Guard flag
+        # recently (Proposal 236). None if the consensus 'w' line didn't
+        # include a GuardFraction entry (i.e. no recent Guard flag change).
+        self.guardfraction = guardfraction
+        # List of family ID strings (Happy Families, Proposal 321), e.g.
+        # ['ed25519:AAAA...']. Empty list if the relay has none. Populated
+        # by process_consensuses.py from up to two sources, merged
+        # together (see issue #12):
+        #   (a) server descriptors' 'family-cert' entries - always
+        #       available regardless of whether --microdescs_dir was
+        #       given, since server descriptors are read unconditionally
+        #       and get republished ~every 18h even when unchanged.
+        #   (b) microdescriptors' 'family-ids' line - only available if
+        #       --microdescs_dir was given, and even then only as well as
+        #       that archive's date-range coverage allows (microdescs are
+        #       content-addressed and only re-archived when their content
+        #       changes, so this source alone can have real gaps - source
+        #       (a) doesn't have this problem).
+        self.family_ids = family_ids if family_ids is not None else []
+        # [B6] True iff the relay advertises Relay=5 in the consensus 'pr'
+        # line (conflux protocol support). Only relevant for exit
+        # selection - conflux only needs to be negotiated with the last
+        # hop, so guards/middles don't need this.
+        self.supports_conflux = supports_conflux
     
 
 class NetworkStatusDocument:
@@ -115,7 +160,7 @@ class ServerDescriptor:
     with stem.descriptor.server_descriptor.RelayDescriptor.
     """
     def __init__(self, fingerprint, hibernating, nickname, family, address,
-        exit_policy, ntor_onion_key):
+        exit_policy, ntor_onion_key, ipv6_address=None):
         self.fingerprint = fingerprint
         self.hibernating = hibernating
         self.nickname = nickname
@@ -123,6 +168,10 @@ class ServerDescriptor:
         self.address = address
         self.exit_policy = exit_policy
         self.ntor_onion_key = ntor_onion_key
+        # IPv6 OR address as a string, or None if the relay has none.
+        # Used for IPv6 /32 subnet-conflict checks (mirrors
+        # router_addrs_in_same_network()'s AF_INET6 case in nodelist.c).
+        self.ipv6_address = ipv6_address
 
 
     def __getstate__(self):
@@ -137,6 +186,7 @@ class ServerDescriptor:
         state['address'] = self.address
         state['exit_policy'] = str(self.exit_policy)
         state['ntor_onion_key'] = self.ntor_onion_key
+        state['ipv6_address'] = self.ipv6_address
         
         return state
 
@@ -152,6 +202,9 @@ class ServerDescriptor:
         self.address = state['address']
         self.exit_policy = ExitPolicy(*state['exit_policy'].split(', '))
         self.ntor_onion_key = state['ntor_onion_key']
+        # .get() with a default so pickles created before this field existed
+        # (i.e. network-state files generated before this patch) still load.
+        self.ipv6_address = state.get('ipv6_address', None)
     
 
 def timestamp(t):
@@ -188,44 +241,100 @@ def pad_network_state_files(network_state_files):
     return network_state_files_padded
 
 
-def get_bw_weight(flags, position, bw_weights):
-    """Returns weight to apply to relay's bandwidth for given position.
-        flags: list of Flag values for relay from a consensus
-        position: position for which to find selection weight,
-             one of 'g' for guard, 'm' for middle, and 'e' for exit
-        bw_weights: bandwidth_weights from NetworkStatusDocumentV3 consensus
-    """
-    
-    if (position == 'g'):
-        if (Flag.GUARD in flags) and (Flag.EXIT in flags):
-            return bw_weights['Wgd']
-        elif (Flag.GUARD in flags):
-            return bw_weights['Wgg']
-        elif (Flag.EXIT not in flags):
-            return bw_weights['Wgm']
-        else:
-            raise ValueError('Wge weight does not exist.')
-    elif (position == 'm'):
-        if (Flag.GUARD in flags) and (Flag.EXIT in flags):
-            return bw_weights['Wmd']
-        elif (Flag.GUARD in flags):
-            return bw_weights['Wmg']
-        elif (Flag.EXIT in flags):
-            return bw_weights['Wme']
-        else:
-            return bw_weights['Wmm']
-    elif (position == 'e'):
-        if (Flag.GUARD in flags) and (Flag.EXIT in flags):
-            return bw_weights['Wed']
-        elif (Flag.GUARD in flags):
-            return bw_weights['Weg']
-        elif (Flag.EXIT in flags):
-            return bw_weights['Wee']
-        else:
-            return bw_weights['Wem']    
+# Real node_select.c's compute_weighted_bandwidths() uses "that category's
+# own" V2Dir multiplier for each category (guard-only, guard+exit,
+# exit-only, middle): guard+exit -> Wd/Wdb, guard-only -> Wg/Wgb (the
+# without-guard side is middle: Wm/Wmb), exit-only -> We/Web,
+# middle -> Wm/Wmb.
+_CATEGORY_MAIN_KEYS = {
+    # (is_guard, is_exit) -> (weight_key, dir_key)
+    (True, True):  ('Wd', 'Wdb'),
+    (True, False): ('Wg', 'Wgb'),
+    (False, True): ('We', 'Web'),
+    (False, False):('Wm', 'Wmb'),
+}
+# The "without guard flag" category used for guardfraction blending:
+# guard+exit -> exit-only, guard-only -> middle. (exit-only/middle nodes
+# already have is_guard=False, so guardfraction doesn't apply to them in
+# the first place - the real source never uses weight_without_guard_flag
+# in that case either.)
+_WITHOUT_GUARD_CATEGORY = {
+    (True, True):  (False, True),   # guard+exit -> exit-only
+    (True, False): (False, False),  # guard-only -> middle
+}
+
+
+def _position_weight_names(position):
+    """For a given position ('g'/'m'/'e'), returns the consensus
+    bandwidth-weights key name that each category (Wg/Wm/We/Wd) should
+    actually reference. (Identical to the WEIGHT_FOR_GUARD/MID/EXIT
+    branches in node_select.c.)"""
+    if position == 'g':
+        return {'Wg': 'Wgg', 'Wm': 'Wgm', 'We': None, 'Wd': 'Wgd'}
+    elif position == 'm':
+        return {'Wg': 'Wmg', 'Wm': 'Wmm', 'We': 'Wme', 'Wd': 'Wmd'}
+    elif position == 'e':
+        return {'Wg': 'Weg', 'Wm': 'Wem', 'We': 'Wee', 'Wd': 'Wed'}
     else:
-        raise ValueError('get_weight does not support position {0}.'.format(
+        raise ValueError('get_bw_weight does not support position {0}.'.format(
             position))
+
+
+def get_bw_weight(flags, position, bw_weights, bwweightscale=None,
+    guardfraction=None):
+    """Returns weight to apply to relay's bandwidth for given position.
+    Mirrors node_select.c's compute_weighted_bandwidths() exactly:
+      - BadExit relays are treated as not-exit for weighting (is_exit =
+        Exit flag present AND NOT BadExit).
+      - V2Dir relays get their weight multiplied by the matching
+        category's Wgb/Wmb/Web/Wdb directory-cache weight; each of the
+        "with guard flag" and "without guard flag" quantities used for
+        guardfraction blending gets *its own* category's dir multiplier
+        (this differs from a naive implementation that discounts only
+        once, after blending).
+      - guardfraction blending only applies when position != 'g' and the
+        relay currently has the Guard flag (has_guardfraction), per
+        Tor's `rule != WEIGHT_FOR_GUARD` condition.
+
+        flags: list of Flag values for relay from a consensus
+        position: 'g' (guard), 'm' (middle), or 'e' (exit)
+        bw_weights: bandwidth_weights from NetworkStatusDocumentV3 consensus
+        bwweightscale: consensus bwweightscale; if None, weights are used
+             unnormalized (fine as long as this is applied consistently
+             across all candidates being compared, since it's a constant
+             overall scale factor - but passing it is recommended).
+        guardfraction: float in [0,1] or None (see RouterStatusEntry)
+    """
+    is_guard = (Flag.GUARD in flags)
+    is_exit = (Flag.EXIT in flags) and (Flag.BADEXIT not in flags)
+    is_dir = (Flag.V2DIR in flags)
+
+    names = _position_weight_names(position)
+    scale = float(bwweightscale) if bwweightscale is not None else 1.0
+
+    def _weight_for(cat_is_guard, cat_is_exit):
+        cat_key, dir_key = _CATEGORY_MAIN_KEYS[(cat_is_guard, cat_is_exit)]
+        weight_name = names[cat_key]
+        if weight_name is None:
+            # e.g. position=='g' has no 'We' entry; shouldn't be reached
+            # for a real candidate in that category at that position.
+            raise ValueError(
+                'No {0} weight defined for position {1}.'.format(
+                    cat_key, position))
+        w = float(bw_weights[weight_name]) / scale
+        if is_dir:
+            w *= float(bw_weights[dir_key]) / scale
+        return w
+
+    weight = _weight_for(is_guard, is_exit)
+
+    if (position != 'g') and is_guard and (guardfraction is not None):
+        wg_cat = _WITHOUT_GUARD_CATEGORY[(is_guard, is_exit)]
+        weight_without_guard = _weight_for(*wg_cat)
+        weight = (guardfraction * weight +
+                  (1.0 - guardfraction) * weight_without_guard)
+
+    return weight
 
             
 def select_weighted_node(weighted_nodes):
@@ -348,12 +457,15 @@ def filter_exits_loose(cons_rel_stats, descriptors, fast, stable, internal,\
     
 def get_position_weights(nodes, cons_rel_stats, position, bw_weights,\
     bwweightscale):
-    """Computes the consensus "bandwidth" weighted by position weights."""
+    """Computes the consensus "bandwidth" weighted by position weights.
+    get_bw_weight() already normalizes by bwweightscale internally, so we
+    just multiply its (already-normalized) return value by raw bandwidth."""
     weights = {}
     for node in nodes:
-        bw = float(cons_rel_stats[node].bandwidth)
-        weight = float(get_bw_weight(cons_rel_stats[node].flags,\
-            position,bw_weights)) / float(bwweightscale)
+        rel_stat = cons_rel_stats[node]
+        bw = float(rel_stat.bandwidth)
+        weight = get_bw_weight(rel_stat.flags, position, bw_weights,
+            bwweightscale, getattr(rel_stat, 'guardfraction', None))
         weights[node] = bw * weight
     return weights 
     
@@ -379,9 +491,17 @@ def get_weighted_nodes(nodes, weights):
     return weighted_nodes         
 
     
-def in_same_family(descriptors, node1, node2):
-    """Takes list of descriptors and two node fingerprints,
-    checks if nodes list each other as in the same family."""
+def in_same_family(cons_rel_stats, descriptors, node1, node2):
+    """Takes list of descriptors and two node fingerprints, and checks if
+    they should be considered in the same family - true if EITHER:
+      (a) they mutually list each other in their declared_family
+          (the old MyFamily-based mechanism), OR
+      (b) [#12] they share at least one common family ID (Happy Families,
+          Proposal 321), per RouterStatusEntry.family_ids - sourced from
+          server descriptors' family-cert entries and/or microdescriptors'
+          family-ids line (see RouterStatusEntry.family_ids docstring).
+    Mirrors nodes_in_same_family() checking both use_family_lists and
+    use_family_ids conditions with an OR."""
 
     desc1 = descriptors[node1]
     desc2 = descriptors[node2]
@@ -401,6 +521,12 @@ def in_same_family(descriptors, node1, node2):
             if ((member[0] == '$') and (member[1:] == fprint1)) or\
                 (member == nick1):
                 return True
+
+    # [#12] Family ID overlap check
+    ids1 = getattr(cons_rel_stats.get(node1), 'family_ids', None) if node1 in cons_rel_stats else None
+    ids2 = getattr(cons_rel_stats.get(node2), 'family_ids', None) if node2 in cons_rel_stats else None
+    if ids1 and ids2 and (set(ids1) & set(ids2)):
+        return True
 
     return False
 
@@ -424,35 +550,84 @@ def in_same_16_subnet(address1, address2):
     return True
 
 
+def in_same_ipv6_subnet(address1, address2):
+    """Takes IPv6 addresses as strings and checks if the first 32 bits
+    (first two 16-bit groups) match. Mirrors the AF_INET6 case of
+    router_addrs_in_same_network() in nodelist.c, which uses a /32 mask
+    (as opposed to /16 for IPv4). Returns False if either address is
+    missing/malformed rather than raising."""
+    if (not address1) or (not address2):
+        return False
+    try:
+        b1 = socket.inet_pton(socket.AF_INET6, address1)
+        b2 = socket.inet_pton(socket.AF_INET6, address2)
+    except (socket.error, OSError, ValueError):
+        return False
+    return b1[:4] == b2[:4]
+
+
+def in_same_subnet(descriptors, node1, node2):
+    """Returns True if node1 and node2 should be considered in the same
+    subnet for path-selection exclusion purposes - true if EITHER their
+    IPv4 addresses share a /16, OR (if both have one) their IPv6 addresses
+    share a /32. Mirrors nodes_in_same_family()/router_addrs_in_same_network()
+    checking both address families and OR-ing the result, rather than only
+    ever checking IPv4 (the previous pathsim.py behavior, issue #13)."""
+    desc1 = descriptors[node1]
+    desc2 = descriptors[node2]
+
+    if in_same_16_subnet(desc1.address, desc2.address):
+        return True
+
+    ipv6_1 = getattr(desc1, 'ipv6_address', None)
+    ipv6_2 = getattr(desc2, 'ipv6_address', None)
+    if ipv6_1 and ipv6_2 and in_same_ipv6_subnet(ipv6_1, ipv6_2):
+        return True
+
+    return False
+
+
 def middle_filter(node, cons_rel_stats, descriptors, fast=None,\
-    stable=None, exit_node=None, guard_node=None):
+    stable=None, exit_node=None, guard_node=None, extra_exclude=None):
     """Return if candidate node is suitable as middle node. If an optional
     argument is omitted, then the corresponding filter condition will be
     skipped. This is useful for early filtering when some arguments are still
-    unknown."""
+    unknown.
+    extra_exclude: [B6] optional iterable of fingerprints to additionally
+    exclude (family/subnet/identity), used for conflux to keep a leg's
+    middle from overlapping with the other leg's guard/middle
+    (conflux_add_middles_to_exclude_list() in circuitbuild.c)."""
     # Note that we intentionally allow non-Valid routers for middle
     # as per path-spec.txt default config    
     rel_stat = cons_rel_stats[node]
-    return (Flag.RUNNING in rel_stat.flags) and\
+    if not ((Flag.RUNNING in rel_stat.flags) and\
             ((fast==None) or (not fast) or\
                 (Flag.FAST in rel_stat.flags)) and\
             ((stable==None) or (not stable) or\
                 (Flag.STABLE in rel_stat.flags)) and\
             ((exit_node==None) or\
                 ((exit_node != node) and\
-                    (not in_same_family(descriptors, exit_node, node)) and\
-                    (not in_same_16_subnet(descriptors[exit_node].address,\
-                        descriptors[node].address)))) and\
+                    (not in_same_family(cons_rel_stats, descriptors, exit_node, node)) and\
+                    (not in_same_subnet(descriptors, exit_node, node)))) and\
             ((guard_node==None) or\
                 ((guard_node != node) and\
-                    (not in_same_family(descriptors, guard_node, node)) and\
-                    (not in_same_16_subnet(descriptors[guard_node].address,\
-                        descriptors[node].address))))
+                    (not in_same_family(cons_rel_stats, descriptors, guard_node, node)) and\
+                    (not in_same_subnet(descriptors, guard_node, node))))):
+        return False
+    if extra_exclude:
+        for other in extra_exclude:
+            if (node == other) or\
+                in_same_family(cons_rel_stats, descriptors, node, other) or\
+                in_same_subnet(descriptors, node, other):
+                return False
+    return True
                         
 
 def select_middle_node(bw_weights, bwweightscale, cons_rel_stats, descriptors,\
-    fast, stable, exit_node, guard_node, weighted_middles=None):
-    """Chooses a valid middle node by selecting randomly until one is found."""
+    fast, stable, exit_node, guard_node, weighted_middles=None,
+    extra_exclude=None):
+    """Chooses a valid middle node by selecting randomly until one is found.
+    extra_exclude: see middle_filter()."""
 
     # create weighted middles if not given
     if (weighted_middles == None):
@@ -470,7 +645,7 @@ def select_middle_node(bw_weights, bwweightscale, cons_rel_stats, descriptors,\
             print('select_middle_node() made choice #{0}.'.format(i))
         i += 1
         if (middle_filter(middle_node, cons_rel_stats, descriptors, fast,\
-            stable, exit_node, guard_node)):
+            stable, exit_node, guard_node, extra_exclude)):
             break
     return middle_node
 
@@ -516,9 +691,8 @@ def guard_filter_for_circ(guard, cons_rel_stats, descriptors, fast,\
                 ((guards[guard]['unreachable_since'] == None) or\
                     guard_is_time_to_retry(guards[guard],circ_time)) and\
                 (exit != guard) and\
-                (not in_same_family(descriptors, exit, guard)) and\
-                (not in_same_16_subnet(descriptors[exit].address,\
-                    descriptors[guard].address))
+                (not in_same_family(cons_rel_stats, descriptors, exit, guard)) and\
+                (not in_same_subnet(descriptors, exit, guard))
         else:
             raise ValueError('Guard {0} not present in consensus or\ descriptors but wasn\'t marked bad.'.format(guard))
     else:
@@ -528,6 +702,11 @@ def guard_filter_for_circ(guard, cons_rel_stats, descriptors, fast,\
 def filter_guards(cons_rel_stats, descriptors):
     """Returns relays filtered by general (non-client-specific) guard criteria.
     In particular, omits checks for IP/family/subnet conflicts within list.
+
+    Mirrors node_is_possible_guard() in entrynodes.c, which requires
+    node_is_dir(node) (i.e. the V2Dir flag) as part of guard eligibility -
+    not just an optional weighting bonus, but a hard filter on the
+    candidate pool itself.
     """
     guards = []
     for fprint in cons_rel_stats:
@@ -535,6 +714,7 @@ def filter_guards(cons_rel_stats, descriptors):
         if (Flag.RUNNING in rel_stat.flags) and\
             (Flag.VALID in rel_stat.flags) and\
             (Flag.GUARD in rel_stat.flags) and\
+            (Flag.V2DIR in rel_stat.flags) and\
             (fprint in descriptors):
             guards.append(fprint)   
     
@@ -571,9 +751,8 @@ def get_new_guard(bw_weights, bwweightscale, cons_rel_stats, descriptors,\
         guard_conflict = False
         for client_guard in client_guards:
             if (client_guard == guard_node) or\
-                (in_same_family(descriptors, client_guard, guard_node)) or\
-                (in_same_16_subnet(descriptors[client_guard].address,\
-                   descriptors[guard_node].address)):
+                (in_same_family(cons_rel_stats, descriptors, client_guard, guard_node)) or\
+                (in_same_subnet(descriptors, client_guard, guard_node)):
                 guard_conflict = True
                 break
         if (not guard_conflict):
@@ -658,6 +837,28 @@ def circuit_covers_port_need(circuit, descriptors, port, need):
             (can_exit_to_port(descriptors[circuit['path'][-1]], port))
 
 
+def conflux_set_supports_stream(conflux_set, stream, descriptors):
+    """[B6] Like circuit_supports_stream(), but for a conflux_set (which
+    has 'exit_node' instead of a 'path' tuple, and is never internal -
+    real Tor excludes onion-service/internal circuits from conflux
+    entirely, per pathbias_should_count()'s CIRCUIT_PURPOSE_CONFLUX_*
+    exclusions and conflux's general design)."""
+    desc = descriptors[conflux_set['exit_node']]
+    if (stream['type'] == 'connect'):
+        if (stream['ip'] == None):
+            raise ValueError('Stream must have ip.')
+        if (stream['port'] == None):
+            raise ValueError('Stream must have port.')
+        return (desc.exit_policy.can_exit_to(stream['ip'], stream['port'])) and\
+            ((conflux_set['stable']) or\
+                (stream['port'] not in TorOptions.long_lived_ports))
+    elif (stream['type'] == 'resolve'):
+        return (not policy_is_reject_star(desc.exit_policy))
+    else:
+        raise ValueError('ERROR: Unrecognized stream in \
+conflux_set_supports_stream: {0}'.format(stream['type']))
+
+
 def circuit_supports_stream(circuit, stream, descriptors):
     """Returns if stream can run over circuit (which is assumed live)."""
 
@@ -738,6 +939,45 @@ def kill_circuits_by_relay(client_state, relay_down_fn, msg):
             uncover_circuit_ports(circuit, client_state['port_needs_covered'])
     client_state['clean_exit_circuits'] = new_clean_exit_circuits
 
+    # [B6] go through dirty conflux sets - a set is killed if the shared
+    # exit or *any* leg's guard/middle is down (simplification: real Tor
+    # can potentially keep a set alive on its remaining leg if only one
+    # leg's node fails, but modeling partial-set survival is out of scope
+    # here).
+    def _conflux_set_down(conflux_set):
+        if relay_down_fn(conflux_set['exit_node']):
+            return conflux_set['exit_node']
+        for (guard_node, middle_node) in conflux_set['legs']:
+            if relay_down_fn(guard_node):
+                return guard_node
+            if relay_down_fn(middle_node):
+                return middle_node
+        return None
+
+    new_dirty_conflux_sets = collections.deque()
+    while (len(client_state['dirty_conflux_sets']) > 0):
+        conflux_set = client_state['dirty_conflux_sets'].popleft()
+        rel_down = _conflux_set_down(conflux_set)
+        if (rel_down == None):
+            new_dirty_conflux_sets.append(conflux_set)
+        else:
+            if (_testing):
+                print('Killing dirty conflux set because {0} {1}.'.
+                    format(rel_down, msg))
+    client_state['dirty_conflux_sets'] = new_dirty_conflux_sets
+
+    new_clean_conflux_sets = collections.deque()
+    while (len(client_state['clean_conflux_sets']) > 0):
+        conflux_set = client_state['clean_conflux_sets'].popleft()
+        rel_down = _conflux_set_down(conflux_set)
+        if (rel_down == None):
+            new_clean_conflux_sets.append(conflux_set)
+        else:
+            if (_testing):
+                print('Killing clean conflux set because {0} {1}.'.
+                    format(rel_down, msg))
+    client_state['clean_conflux_sets'] = new_clean_conflux_sets
+
 
 def get_network_state(ns_file):
     """Reads in network state file, returns NetworkState object."""
@@ -817,53 +1057,17 @@ def period_client_update(client_state, cons_rel_stats, cons_fresh_until,\
         print('Updating state for client {0} given new consensus.'.\
             format(client_state['id']))
             
-    # Update guard list
-    # Tor does this stuff whenever a descriptor is obtained        
-    guards = client_state['guards']                
-    for guard, guard_props in guards.items():
-        # set guard as down if (following Tor's
-        # entry_guard_set_status)
-        # - not in current nodelist (!node check)
-        #   - note that a node can appear the nodelist but not
-        #     in consensus if it has an existing descriptor
-        #     in routerlist (unclear to me when this gets purged)
-        # - Running flag not set
-        #   - note that all nodes not in current consensus get
-        #     *all* their node flags set to zero
-        # - Guard flag not set [and not a bridge])
-        # note that hibernating *not* considered here
-        if (guard_props['bad_since'] == None):
-            if (guard not in cons_rel_stats) or\
-                (Flag.RUNNING not in\
-                 cons_rel_stats[guard].flags) or\
-                (Flag.GUARD not in\
-                 cons_rel_stats[guard].flags):
-                if _testing:
-                    print('Putting down guard {0}'.format(guard))
-                guard_props['bad_since'] = cons_valid_after
-        else:
-            if (guard in cons_rel_stats) and\
-                (Flag.RUNNING in\
-                 cons_rel_stats[guard].flags) and\
-                (Flag.GUARD in\
-                 cons_rel_stats[guard].flags):
-                if _testing:
-                    print('Bringing up guard {0}'.format(guard))
-                guard_props['bad_since'] = None
-        # remove if down time including this period exceeds limit
-        if (guard_props['bad_since'] != None):
-            if (cons_fresh_until-guard_props['bad_since'] >=\
-                TorOptions.guard_down_time):
-                if _testing:
-                    print('Guard down too long, removing: {0}'.\
-                        format(guard))
-                del guards[guard]
-                continue
-        # expire old guards
-        if (guard_props['expires'] <= cons_valid_after):
-            if _testing:
-                print('Expiring guard: {0}'.format(guard))
-            del guards[guard]
+    # Update guard list (Proposal 271 version)
+    # This used to directly manipulate the guards dict's bad_since/expires
+    # fields here, but that logic has moved into
+    # GuardSelectionState.update_listed_status() (listed/unlisted
+    # determination + removing guards unlisted or expired for too long -
+    # this now also covers the old logic's two conditions, "remove if past
+    # guard_down_time" and "remove if past expires", which correspond to
+    # guard-spec's REMOVE_UNLISTED_GUARDS_AFTER / GUARD_LIFETIME /
+    # GUARD_CONFIRMED_MIN_LIFETIME; see issue B4 in the issue tracker doc).
+    guards = client_state['guards']
+    guards.update_listed_status(cons_rel_stats, cons_valid_after)
     
     # Kill circuits using relays that now appear to be "down", where
     #  down is not in consensus or without Running flag.            
@@ -909,7 +1113,8 @@ def timed_client_updates(cur_time, client_state, port_needs_global,
     cons_rel_stats, cons_valid_after,
     cons_fresh_until, cons_bw_weights, cons_bwweightscale, descriptors,
     hibernating_status, port_need_weighted_exits, weighted_middles,
-    weighted_guards, congmodel, pdelmodel, callbacks=None):
+    weighted_guards, congmodel, pdelmodel, callbacks=None,
+    exit_conflux_ratio=0.0, conflux_stats=None):
     """Performs updates to client state that occur on a time schedule."""
     
     guards = client_state['guards']
@@ -933,10 +1138,53 @@ def timed_client_updates(cur_time, client_state, port_needs_global,
         uncover_circuit_ports(client_state['clean_exit_circuits'][-1],\
             client_state['port_needs_covered'])
         client_state['clean_exit_circuits'].pop()
+
+    # [B6] kill old dirty/clean conflux sets, same lifetime rules as
+    # ordinary circuits (real Tor's conflux sets follow the same general
+    # circuit lifetime handling in circuituse.c)
+    while (len(client_state['dirty_conflux_sets'])>0) and\
+            (client_state['dirty_conflux_sets'][-1]['dirty_time'] <=\
+                cur_time - TorOptions.max_circuit_dirtiness):
+        if _testing:
+            print('Killed dirty conflux set at time {0}'.format(cur_time))
+        client_state['dirty_conflux_sets'].pop()
+
+    while (len(client_state['clean_conflux_sets'])>0) and\
+            (client_state['clean_conflux_sets'][-1]['time'] <=\
+                cur_time - TorOptions.circuit_idle_timeout):
+        if _testing:
+            print('Killed clean conflux set at time {0}'.format(cur_time))
+        client_state['clean_conflux_sets'].pop()
         
     # kill circuits with relays that have gone into hibernation
     kill_circuits_by_relay(client_state, \
         lambda r: hibernating_status[r], 'is hibernating')
+
+    # [B6] refill the prebuilt conflux pool up to
+    # get_max_prebuilt_conflux_sets(exit_conflux_ratio). Real Tor prebuilds
+    # these speculatively (not tied to a specific port/stream need), so we
+    # don't gate this on port_needs_global the way ordinary clean circuits
+    # are - it just tries to keep the pool topped up.
+    if TorOptions.cfx_enabled:
+        max_prebuilt = get_max_prebuilt_conflux_sets(exit_conflux_ratio)
+        while len(client_state['clean_conflux_sets']) < max_prebuilt:
+            try:
+                new_set = create_conflux_set(cons_rel_stats,
+                    cons_valid_after, cons_fresh_until, cons_bw_weights,
+                    cons_bwweightscale, descriptors, hibernating_status,
+                    guards, cur_time, True, False, congmodel, pdelmodel,
+                    callbacks, weighted_middles, weighted_guards)
+            except ValueError:
+                # Not enough distinct usable nodes right now (e.g. very
+                # small/sparse network) - stop trying this round rather
+                # than looping forever.
+                break
+            client_state['clean_conflux_sets'].appendleft(new_set)
+            if conflux_stats is not None:
+                conflux_stats['sets_created'] += 1
+            if _testing:
+                print('Created prebuilt conflux set at time {0}.'.format(
+                    cur_time))
                   
     # cover uncovered ports while fewer than
     # TorOptions.max_unused_open_circuits clean
@@ -1009,25 +1257,123 @@ def stream_update_port_needs(stream, port_needs_global,
                     client_state['port_needs_covered'][port]\
                         += 1
                     circuit['covering'].add(port)
-        # precompute exit list and weights for new port need
-        port_need_exits = filter_exits(cons_rel_stats,\
-            descriptors, port_needs_global[port]['fast'],\
-            port_needs_global[port]['stable'], False,\
-            None, port)
-        if _testing:                            
+        # precompute exit list and weights for new port need - cached per
+        # (period, port, fast, stable), since this is identical no matter
+        # which user's stream triggered it (see
+        # _get_cached_port_need_exits())
+        pn_weighted_exits = _get_cached_port_need_exits(
+            cons_rel_stats, descriptors, cons_bw_weights, cons_bwweightscale,
+            port_needs_global[port]['fast'], port_needs_global[port]['stable'],
+            port)
+        if _testing:
             print('# exits for new need at port {0}: {1}'.\
-                format(port, len(port_need_exits)))
-        port_need_exit_weights = get_position_weights(\
-            port_need_exits, cons_rel_stats, 'e',\
-            cons_bw_weights, cons_bwweightscale)
-        pn_weighted_exits = \
-            get_weighted_nodes(port_need_exits, port_need_exit_weights)
+                format(port, len(pn_weighted_exits)))
         port_need_weighted_exits[port] = pn_weighted_exits
         
         
+# Cache for get_stream_port_weighted_exits() / select_conflux_exit_node()
+# / _get_cached_port_need_exits() / _period_pools_for(): the
+# filtered+weighted candidate lists these build only depend on the
+# current consensus (and, for exits, the (type, port) criteria) - not on
+# which stream/circuit/user is asking - so every caller sharing the same
+# period+criteria can reuse one computation instead of each re-scanning
+# every relay from scratch. This lives at module level (not as a local in
+# create_circuits()) because --user_model all calls create_circuits()
+# once *per user* (thousands per chunk), each independently re-walking
+# every network-state period in order; a per-call local cache would be
+# rebuilt from zero on every single one of those calls.
+#
+# Keyed on id(cons_rel_stats), with one retained sub-dict per period
+# (not just the single most-recent period): under --user_model all, the
+# call order is user-major/period-minor - user 1 walks periods 1..N, then
+# user 2 walks periods 1..N again, etc. - so a single-slot cache keyed on
+# "most recent period" would be evicted by the time processing returns to
+# period 1 for the next user and would *never* actually hit across users,
+# defeating the point. Retaining one entry per period is safe here
+# specifically because the same NetworkState objects (and hence the same
+# cons_rel_stats instances) are held alive for the entire process via the
+# materialized network_states_list in __main__, so id() can't be reused
+# by an unrelated, later object; the cache is bounded by the number of
+# distinct periods in the run (e.g. 24 for a one-day nsf_dir).
+_exit_cache = {}
+
+
+def _exit_cache_for_period(cons_rel_stats):
+    period_key = id(cons_rel_stats)
+    period_cache = _exit_cache.get(period_key)
+    if period_cache is None:
+        period_cache = {}
+        _exit_cache[period_key] = period_cache
+    return period_cache
+
+
+def _get_cached_port_need_exits(cons_rel_stats, descriptors,
+    cons_bw_weights, cons_bwweightscale, fast, stable, port):
+    """Weighted exit list for a 'port need' (predictive circuit-building
+    port), cached per (period, port, fast, stable). Used both by
+    create_circuits()'s per-period port-need refresh and by
+    stream_update_port_needs() when a stream introduces a new port need -
+    both compute the exact same network-state-derived value for a given
+    period/port, regardless of which user/client triggered it."""
+    cache = _exit_cache_for_period(cons_rel_stats)
+    cache_key = ('portneed', port, fast, stable)
+    weighted_exits = cache.get(cache_key)
+    if weighted_exits is None:
+        port_need_exits = filter_exits(cons_rel_stats, descriptors, fast,
+            stable, False, None, port)
+        port_need_exit_weights = get_position_weights(port_need_exits,
+            cons_rel_stats, 'e', cons_bw_weights, cons_bwweightscale)
+        weighted_exits = get_weighted_nodes(port_need_exits,
+            port_need_exit_weights)
+        cache[cache_key] = weighted_exits
+    return weighted_exits
+
+
+# Cache for create_circuits()'s once-per-period pools: weighted_middles,
+# weighted_guards, and exit_conflux_ratio all depend only on the current
+# consensus, not on which user/client is being simulated. Same rationale
+# and safety argument as _exit_cache above (--user_model all's
+# once-per-user call pattern, cons_rel_stats objects kept alive for the
+# whole run) - see the comment there.
+_period_pool_cache = {}
+
+
+def _period_pools_for(cons_rel_stats, descriptors, cons_bw_weights,
+                       cons_bwweightscale):
+    """Returns (weighted_middles, weighted_guards, exit_conflux_ratio) for
+    this consensus period, computed once and reused by every
+    create_circuits() call that processes the same period."""
+    period_key = id(cons_rel_stats)
+    pools = _period_pool_cache.get(period_key)
+    if pools is None:
+        potential_middles = filter(lambda x: middle_filter(x, cons_rel_stats,
+            descriptors, None, None, None, None), cons_rel_stats.keys())
+        potential_middle_weights = get_position_weights(potential_middles,
+            cons_rel_stats, 'm', cons_bw_weights, cons_bwweightscale)
+        weighted_middles = get_weighted_nodes(potential_middles,
+            potential_middle_weights)
+
+        potential_guards = filter_guards(cons_rel_stats, descriptors)
+        potential_guard_weights = get_position_weights(potential_guards,
+            cons_rel_stats, 'g', cons_bw_weights, cons_bwweightscale)
+        weighted_guards = get_weighted_nodes(potential_guards,
+            potential_guard_weights)
+
+        exit_conflux_ratio = compute_exit_conflux_ratio(cons_rel_stats)
+
+        pools = (weighted_middles, weighted_guards, exit_conflux_ratio)
+        _period_pool_cache[period_key] = pools
+    return pools
+
+
 def get_stream_port_weighted_exits(stream_port, stream,
-    cons_rel_stats, descriptors, cons_bw_weights, cons_bwweightscale): 
+    cons_rel_stats, descriptors, cons_bw_weights, cons_bwweightscale):
     """Returns weighted exit list for port of stream."""
+    cache = _exit_cache_for_period(cons_rel_stats)
+    cache_key = ('stream', stream['type'], stream_port)
+    if cache_key in cache:
+        return cache[cache_key]
+
     if (stream['type'] == 'connect'):
         stable = (stream_port in TorOptions.long_lived_ports)
         stream_exits =\
@@ -1053,14 +1399,21 @@ def get_stream_port_weighted_exits(stream_port, stream,
         cons_bw_weights, cons_bwweightscale)
     stream_weighted_exits = get_weighted_nodes(\
         stream_exits, stream_exit_weights)
-    return stream_weighted_exits                               
+    cache[cache_key] = stream_weighted_exits
+    return stream_weighted_exits
         
         
 def client_assign_stream(client_state, stream, cons_rel_stats,
     cons_valid_after, cons_fresh_until, cons_bw_weights, cons_bwweightscale,
     descriptors, hibernating_status, stream_weighted_exits,
-    weighted_middles, weighted_guards, congmodel, pdelmodel, callbacks=None):
-    """Assigns a stream to a circuit for a given client."""
+    weighted_middles, weighted_guards, congmodel, pdelmodel, callbacks=None,
+    conflux_stats=None):
+    """Assigns a stream to a circuit for a given client.
+    conflux_stats: [B6] optional dict with keys 'sets_used_for_stream' and
+    'single_circuits_used_for_stream', incremented here so callers can
+    report how much traffic actually ended up using conflux vs. plain
+    single circuits (see the summary printed at the end of
+    create_circuits())."""
         
     guards = client_state['guards']
     stream_assigned = None
@@ -1112,8 +1465,44 @@ at {0}'.format(stream['time']))
                 new_clean_exit_circuits.append(circuit)
         client_state['clean_exit_circuits'] =\
             new_clean_exit_circuits
+
+    # [B6] next try to reuse a dirty conflux set
+    if (stream_assigned == None) and TorOptions.cfx_enabled:
+        for conflux_set in client_state['dirty_conflux_sets']:
+            if (conflux_set['dirty_time'] > \
+                    stream['time'] - TorOptions.max_circuit_dirtiness) and\
+                conflux_set_supports_stream(conflux_set, stream, descriptors):
+                stream_assigned = conflux_set
+                if conflux_stats is not None:
+                    conflux_stats['sets_used_for_stream'] += 1
+                if _testing:
+                    print('Assigned stream to dirty conflux set at {0}'.
+                        format(stream['time']))
+                break
+
+    # [B6] next try to promote a clean (prebuilt) conflux set
+    if (stream_assigned == None) and TorOptions.cfx_enabled:
+        new_clean_conflux_sets = collections.deque()
+        while (len(client_state['clean_conflux_sets']) > 0):
+            conflux_set = client_state['clean_conflux_sets'].popleft()
+            if (stream_assigned == None) and\
+                conflux_set_supports_stream(conflux_set, stream, descriptors):
+                stream_assigned = conflux_set
+                conflux_set['dirty_time'] = stream['time']
+                client_state['dirty_conflux_sets'].appendleft(conflux_set)
+                if conflux_stats is not None:
+                    conflux_stats['sets_used_for_stream'] += 1
+                if _testing:
+                    print('Assigned stream to clean (prebuilt) conflux '
+                        'set at {0}'.format(stream['time']))
+            else:
+                new_clean_conflux_sets.append(conflux_set)
+        client_state['clean_conflux_sets'] = new_clean_conflux_sets
+
     # if stream still unassigned we must make new circuit
     if (stream_assigned == None):
+        if conflux_stats is not None:
+            conflux_stats['single_circuits_used_for_stream'] += 1
         new_circ = None
         if (stream['type'] == 'connect'):
             stable = (stream['port'] in TorOptions.long_lived_ports)
@@ -1195,6 +1584,60 @@ def select_exit_node(bw_weights, bwweightscale, cons_rel_stats, descriptors,\
                 return exit_node    
 
 
+def select_conflux_exit_node(bw_weights, bwweightscale, cons_rel_stats,
+    descriptors, fast, stable, ip, port):
+    """Like select_exit_node(), but restricted to exits that advertise
+    conflux support (Relay=5). Conflux is only ever negotiated with the
+    last hop, so this is the only place path selection needs to know
+    about conflux support at all - guards and middles are picked exactly
+    as they would be for an ordinary circuit."""
+    cache = _exit_cache_for_period(cons_rel_stats)
+    cache_key = ('conflux', fast, stable, ip, port)
+    weighted_exits = cache.get(cache_key)
+    if weighted_exits is None:
+        exits = filter_exits(cons_rel_stats, descriptors, fast, stable, False,
+            ip, port)
+        exits = [e for e in exits if cons_rel_stats[e].supports_conflux]
+        if not exits:
+            raise ValueError('No conflux-supporting exits available.')
+        weights = get_position_weights(exits, cons_rel_stats, 'e',
+            bw_weights, bwweightscale)
+        weighted_exits = get_weighted_nodes(exits, weights)
+        cache[cache_key] = weighted_exits
+    return select_weighted_node(weighted_exits)
+
+
+def compute_exit_conflux_ratio(cons_rel_stats):
+    """[B6] Fraction of Exit (non-BadExit) relays in the consensus that
+    support conflux, mirroring count_exit_with_conflux_support() in
+    conflux_params.c. Note this is a plain *count* ratio, not
+    bandwidth-weighted, matching the real source exactly (`supported /
+    total_exits`, no bandwidth involved)."""
+    supported = 0
+    total = 0
+    for rel_stat in cons_rel_stats.values():
+        if (Flag.EXIT not in rel_stat.flags) or (Flag.BADEXIT in rel_stat.flags):
+            continue
+        total += 1
+        if rel_stat.supports_conflux:
+            supported += 1
+    if total == 0:
+        return 0.0
+    return float(supported) / float(total)
+
+
+def get_max_prebuilt_conflux_sets(exit_conflux_ratio):
+    """[B6] Returns how many conflux sets a client should keep prebuilt,
+    mirroring conflux_params_get_max_prebuilt(): 0 if no exits support
+    conflux at all, 1 if the supporting fraction is below
+    cfx_low_exit_threshold, else cfx_max_prebuilt_set."""
+    if exit_conflux_ratio <= 0.0:
+        return 0
+    if exit_conflux_ratio < TorOptions.cfx_low_exit_threshold:
+        return 1
+    return TorOptions.cfx_max_prebuilt_set
+
+
 def circuit_supports_ntor(guard_node, middle_node, exit_node, descriptors):
     """Returns True if one node in circuit has ntor key."""
     
@@ -1273,42 +1716,29 @@ def create_circuit(cons_rel_stats, cons_valid_after, cons_fresh_until,
                 cons_rel_stats[exit_node].nickname,
                 cons_rel_stats[exit_node].fingerprint))
 
-        # select guard node
-        # Hibernation status again checked here to reflect how in Tor
-        # new guards would be chosen and added to the list prior to a circuit-
-        # creation attempt. If the circuit fails at a new guard, that guard
-        # gets removed from the list.
+        # select guard node (Proposal 271 version)
+        # guards is now a GuardSelectionState instance. select_guard_for_circuit()
+        # internally handles the SAMPLED->FILTERED->PRIMARY hierarchy,
+        # "random choice among primaries" (B1), and "V2Dir required for
+        # guard eligibility" (B2). Hibernating status is a different
+        # concept from guard-spec's "unreachable" (temporary shutdown vs.
+        # connection failure), but we simplify by treating it through the
+        # same unreachable_since/mark_guard_result mechanism here.
         while True:
-            # get first <= TorOptions.num_guards guards suitable for circuit
-            circ_guards = get_guards_for_circ(cons_bw_weights,\
-                cons_bwweightscale, cons_rel_stats, descriptors,\
-                circ_fast, circ_stable, guards,\
-                exit_node,\
-                circ_time, weighted_guards)   
-            guard_node = choice(circ_guards)
+            guard_node = guards.select_guard_for_circuit(
+                cons_rel_stats, descriptors, cons_bw_weights,
+                cons_bwweightscale, exit_node, circ_time,
+                circ_fast, circ_stable,
+                guard_is_time_to_retry=guard_is_time_to_retry,
+                weighted_guards=weighted_guards)
             if (hibernating_status[guard_node]):
-                if (not guards[guard_node]['made_contact']):
-                    del guards[guard_node]
-                    if _testing:
-                        print('[Time {0}]: Removed new hibernating guard: {1}.'\
-                            .format(circ_time,
-                                cons_rel_stats[guard_node].nickname))
-                elif (guards[guard_node]['unreachable_since'] != None):
-                    guards[guard_node]['last_attempted'] = circ_time
-                    if _testing:
-                        print('[Time {0}]: Guard retried but hibernating: {1}'.\
-                            format(circ_time,
-                                cons_rel_stats[guard_node].nickname))
-                else:
-                    guards[guard_node]['unreachable_since'] = circ_time
-                    guards[guard_node]['last_attempted'] = circ_time
-                    if _testing:
-                        print('[Time {0}]: Guard newly hibernating: {1}'.\
-                            format(circ_time,
-                                cons_rel_stats[guard_node].nickname))
+                guards.mark_guard_result(guard_node, circ_time, False)
+                if _testing:
+                    print('[Time {0}]: Guard hibernating, retrying: {1}'.\
+                        format(circ_time,
+                            cons_rel_stats[guard_node].nickname))
             else:
-                guards[guard_node]['unreachable_since'] = None
-                guards[guard_node]['made_contact'] = True
+                guards.mark_guard_result(guard_node, circ_time, True)
                 break
         if _testing:
             print('Guard node: {0} [{1}]'.format(
@@ -1361,6 +1791,136 @@ def create_circuit(cons_rel_stats, cons_valid_after, cons_fresh_until,
 
     return circuit
 
+
+def create_conflux_set(cons_rel_stats, cons_valid_after, cons_fresh_until,
+    cons_bw_weights, cons_bwweightscale, descriptors, hibernating_status,
+    guards, circ_time, circ_fast, circ_stable, congmodel, pdelmodel,
+    callbacks=None, weighted_middles=None, weighted_guards=None):
+    """[B6] Creates a conflux set: TorOptions.cfx_num_legs_set (normally 2)
+    circuit legs that share a single exit, with guards/middles picked
+    independently per leg but excluded from overlapping (family/subnet/
+    identity) with the other leg(s)' guard and middle. Mirrors the flow
+    confirmed from the real source:
+      - circuitbuild.c: onion_pick_cpath_exit() picks the exit *once*;
+        both legs reuse it (never re-picked per leg).
+      - entrynodes.c: guards_choose_guard() builds a
+        guard_create_conflux_restriction() excluding the other leg's
+        guard (and the exit) when choosing this leg's guard.
+      - circuitbuild.c: build_middle_exclude_list() calls
+        conflux_add_middles_to_exclude_list() to exclude other
+        pending/built conflux legs' middles.
+
+    Unlike create_circuit(), this does NOT implement the actual
+    traffic-splitting/scheduling behavior between legs (MinRTT/LowRTT -
+    see conflux.c) - it only reproduces path selection (which nodes end
+    up in each leg). How traffic is actually divided between the two
+    legs is left for a separate model (e.g. using pdelmodel) if you need
+    to reason about per-leg observed traffic volume.
+
+    Output: conflux_set (dict) with keys
+        'time': (int) seconds from time zero
+        'fast', 'stable': same meaning as in create_circuit()
+        'exit_node': (str) fingerprint shared by all legs
+        'legs': (list of tuples) each a (guard_node, middle_node) pair -
+            combine with exit_node to get each leg's full path
+        'dirty_time': None (set by caller when a leg/set starts being used)
+    """
+    if (circ_time < cons_valid_after) or\
+        (circ_time >= cons_fresh_until):
+        raise ValueError('consensus not fresh for circ_time in create_conflux_set')
+
+    # Exit is chosen exactly once and shared by all legs.
+    i = 1
+    while True:
+        exit_node = select_conflux_exit_node(cons_bw_weights,
+            cons_bwweightscale, cons_rel_stats, descriptors, circ_fast,
+            circ_stable, None, None)
+        if not hibernating_status[exit_node]:
+            break
+        if _testing:
+            print('Conflux exit selection #{0} is hibernating - retrying.'.
+                format(i))
+        i += 1
+    if _testing:
+        print('Conflux exit node: {0} [{1}]'.format(
+            cons_rel_stats[exit_node].nickname,
+            cons_rel_stats[exit_node].fingerprint))
+
+    legs = []
+    other_guards = []
+    other_middles = []
+    for leg_idx in range(TorOptions.cfx_num_legs_set):
+        num_attempts = 0
+        ntor_supported = False
+        while (num_attempts < TorOptions.max_populate_attempts) and\
+            (not ntor_supported):
+            # guard for this leg - excluded from overlapping with other
+            # legs' guards (guard_create_conflux_restriction)
+            while True:
+                guard_node = guards.select_guard_for_circuit(
+                    cons_rel_stats, descriptors, cons_bw_weights,
+                    cons_bwweightscale, exit_node, circ_time,
+                    circ_fast, circ_stable,
+                    guard_is_time_to_retry=guard_is_time_to_retry,
+                    extra_exclude=other_guards,
+                    weighted_guards=weighted_guards)
+                if hibernating_status[guard_node]:
+                    guards.mark_guard_result(guard_node, circ_time, False)
+                    if _testing:
+                        print('[Time {0}]: Conflux leg {1} guard '
+                            'hibernating, retrying: {2}'.format(
+                                circ_time, leg_idx,
+                                cons_rel_stats[guard_node].nickname))
+                else:
+                    guards.mark_guard_result(guard_node, circ_time, True)
+                    break
+
+            # middle for this leg - excluded from overlapping with other
+            # legs' guards AND middles (conflux_add_middles_to_exclude_list)
+            middle_exclude = other_guards + other_middles
+            j = 1
+            while True:
+                middle_node = select_middle_node(cons_bw_weights,
+                    cons_bwweightscale, cons_rel_stats, descriptors,
+                    circ_fast, circ_stable, exit_node, guard_node,
+                    weighted_middles, extra_exclude=middle_exclude)
+                if not hibernating_status[middle_node]:
+                    break
+                if _testing:
+                    print('Conflux leg {0} middle selection #{1} is '
+                        'hibernating - retrying.'.format(leg_idx, j))
+                j += 1
+
+            ntor_supported = circuit_supports_ntor(guard_node, middle_node,
+                exit_node, descriptors)
+            num_attempts += 1
+
+        if not ntor_supported:
+            raise ValueError('ntor-compatible conflux leg not found in '
+                '{} tries'.format(num_attempts))
+
+        if _testing:
+            print('Conflux leg {0}: guard {1}, middle {2}'.format(
+                leg_idx, cons_rel_stats[guard_node].nickname,
+                cons_rel_stats[middle_node].nickname))
+
+        legs.append((guard_node, middle_node))
+        other_guards.append(guard_node)
+        other_middles.append(middle_node)
+
+    conflux_set = {'time': circ_time,
+        'fast': circ_fast,
+        'stable': circ_stable,
+        'exit_node': exit_node,
+        'legs': legs,
+        'dirty_time': None,
+        'covering': set()}
+
+    if (callbacks is not None) and hasattr(callbacks, 'conflux_set_creation'):
+        callbacks.conflux_set_creation(conflux_set)
+
+    return conflux_set
+
 def create_circuits(network_states, streams, num_samples, congmodel,
     pdelmodel, callbacks=None):
     """Takes streams over time and creates circuits by interaction
@@ -1390,6 +1950,11 @@ def create_circuits(network_states, streams, num_samples, congmodel,
     stream_end = 0
     init = True
 
+    # [B6] running totals for the conflux usage summary printed at the
+    # end of this function.
+    conflux_stats = {'sets_created': 0, 'sets_used_for_stream': 0,
+        'single_circuits_used_for_stream': 0}
+
     # store old descriptors (for entry guards that leave consensus)
     # initialize with add_descriptors 
     descriptors = {}
@@ -1399,15 +1964,19 @@ def create_circuits(network_states, streams, num_samples, congmodel,
     # client states for each sample
     client_states = []
     for i in range(num_samples):
-        # guard is dict with client guard state (expiration, bad_since, etc.)
+        # guard is now not a plain dict but a GuardSelectionState instance
+        # from guard_selection_271.py - holds the SAMPLED/FILTERED/PRIMARY
+        # hierarchy and confirmed order (Proposal 271)
         # port_needs are ports that must be covered by existing circuits        
         # circuit vars are ordered by increasing time since create or dirty
         port_needs_covered = {}
         client_states.append({'id':i,
-                            'guards':{},
+                            'guards':guard_selection_271.GuardSelectionState(),
                             'port_needs_covered':port_needs_covered,
                             'clean_exit_circuits':collections.deque(),
-                            'dirty_exit_circuits':collections.deque()})
+                            'dirty_exit_circuits':collections.deque(),
+                            'clean_conflux_sets':collections.deque(),
+                            'dirty_conflux_sets':collections.deque()})
     ### End simulation variables ###
     
     # run simulation period one network state at a time
@@ -1474,47 +2043,37 @@ def create_circuits(network_states, streams, num_samples, congmodel,
             period_client_update(client_state, cons_rel_stats,\
                 cons_fresh_until, cons_valid_after)
 
-        # filter exits for port needs and compute their weights
-        # do this here to avoid repeating per client
+        # filter exits for port needs and compute their weights - cached
+        # per (period, port, fast, stable) since this is identical no
+        # matter which user/client's create_circuits() call is asking
+        # (see _get_cached_port_need_exits())
         port_need_weighted_exits = {}
         for port, need in port_needs_global.items():
-            port_need_exits = filter_exits(cons_rel_stats, descriptors,\
-                need['fast'], need['stable'], False, None, port)
+            port_need_weighted_exits[port] = _get_cached_port_need_exits(
+                cons_rel_stats, descriptors, cons_bw_weights,
+                cons_bwweightscale, need['fast'], need['stable'], port)
             if _testing:
                 print('# exits for port {0}: {1}'.\
-                    format(port, len(port_need_exits)))
-            port_need_exit_weights = get_position_weights(\
-                port_need_exits, cons_rel_stats, 'e', cons_bw_weights,\
-                cons_bwweightscale)
-            port_need_weighted_exits[port] =\
-                get_weighted_nodes(port_need_exits, port_need_exit_weights)
-                
+                    format(port, len(port_need_weighted_exits[port])))
+
         # Store filtered exits for streams based only on port.
         # Conservative - never excludes a relay that exits to port for some ip.
         # Use port of None to store exits for resolve circuits.
         stream_port_weighted_exits = {}
 
-        # filter middles and precompute cumulative weights
-        potential_middles = filter(lambda x: middle_filter(x, cons_rel_stats,\
-            descriptors, None, None, None, None), cons_rel_stats.keys())
+        # filter/weight middles and guards, and compute exit_conflux_ratio
+        # ([B6] fraction of Exit relays supporting conflux) - cached per
+        # period (see _period_pools_for()), since none of these depend on
+        # which user/client is being simulated, and --user_model all
+        # re-enters this same per-period setup once per user (thousands
+        # of times per chunk) without this cache.
+        weighted_middles, weighted_guards, exit_conflux_ratio = \
+            _period_pools_for(cons_rel_stats, descriptors, cons_bw_weights,
+                cons_bwweightscale)
         if _testing:
-            print('# potential middles: {0}'.format(len(potential_middles)))                
-        potential_middle_weights = get_position_weights(potential_middles,\
-            cons_rel_stats, 'm', cons_bw_weights, cons_bwweightscale)
-        weighted_middles = get_weighted_nodes(potential_middles,\
-            potential_middle_weights)
-            
-        # filter guards and precompute cumulative weights
-        # New guards are selected infrequently after the experiment start
-        # so doing this here instead of on-demand per client may actually
-        # slow things down. We do it to improve scalability with sample number.
-        potential_guards = filter_guards(cons_rel_stats, descriptors)
-        if _testing:
-            print('# potential guards: {0}'.format(len(potential_guards)))        
-        potential_guard_weights = get_position_weights(potential_guards,\
-            cons_rel_stats, 'g', cons_bw_weights, cons_bwweightscale)
-        weighted_guards = get_weighted_nodes(potential_guards,\
-            potential_guard_weights)
+            print('Exit conflux support ratio: {0:.3f} (max prebuilt: '
+                '{1})'.format(exit_conflux_ratio,
+                    get_max_prebuilt_conflux_sets(exit_conflux_ratio)))
        
         # for simplicity, step through time one minute at a time
         time_step = 60
@@ -1533,7 +2092,8 @@ def create_circuits(network_states, streams, num_samples, congmodel,
                     cons_valid_after, cons_fresh_until, cons_bw_weights,
                     cons_bwweightscale, descriptors, hibernating_status,
                     port_need_weighted_exits, weighted_middles,
-                    weighted_guards, congmodel, pdelmodel, callbacks)
+                    weighted_guards, congmodel, pdelmodel, callbacks,
+                    exit_conflux_ratio, conflux_stats)
                     
             # collect streams that occur during current period
             while (stream_start < len(streams)) and\
@@ -1581,9 +2141,33 @@ def create_circuits(network_states, streams, num_samples, congmodel,
                         descriptors, hibernating_status,
                         stream_port_weighted_exits[stream_port],
                         weighted_middles, weighted_guards,
-                        congmodel, pdelmodel, callbacks)
+                        congmodel, pdelmodel, callbacks, conflux_stats)
             
             cur_time += time_step
+
+    if TorOptions.cfx_enabled:
+        total_streams = (conflux_stats['sets_used_for_stream'] +
+            conflux_stats['single_circuits_used_for_stream'])
+        pct_conflux = (100.0 * conflux_stats['sets_used_for_stream'] /
+            total_streams) if total_streams else 0.0
+        # Printed to stderr rather than stdout - stdout carries the
+        # parseable per-circuit TSV output, and mixing this human-readable
+        # summary into it breaks downstream parsing.
+        print >> sys.stderr, ''
+        print >> sys.stderr, '=== Conflux usage summary ==='
+        print >> sys.stderr, 'Prebuilt conflux sets created: {0}'.format(
+            conflux_stats['sets_created'])
+        print >> sys.stderr, 'Streams assigned to a conflux set: {0}'.format(
+            conflux_stats['sets_used_for_stream'])
+        print >> sys.stderr, \
+            'Streams assigned to an ordinary single circuit: {0}'.format(
+            conflux_stats['single_circuits_used_for_stream'])
+        print >> sys.stderr, 'Fraction of streams using conflux: {0:.1f}%'.format(
+            pct_conflux)
+        print >> sys.stderr, ('(Note: this reflects path-selection/pool '
+            'availability only - actual per-leg traffic split, i.e. '
+            'MinRTT/LowRTT scheduling, is not modeled here; see '
+            'create_conflux_set() docstring.)')
 
 
 def get_user_model(start_time, end_time, tracefilename=None,
@@ -1642,6 +2226,23 @@ directories are located')
         help='Output the "fat" representation instead of TorPS classes, which TorPS cannot use for simulation')
     process_parser.add_argument('--initial_descriptor_dir', default=None,
         help='Directory containing descriptors to initialize consensus processing. Needed to provide first consensuses in a month with descriptors only contained in archive from previous month. If omitted, first 24 hours of network state files will likely omit relays due to missing descriptors.')
+    process_parser.add_argument('--microdescs_dir', default=None,
+        help='Optional. Path to a parent folder containing one or more '
+             'extracted CollecTor "microdescs" archives (however nested - '
+             'e.g. several months extracted side by side; the whole tree '
+             'is searched recursively). Used as a supplementary source of '
+             'family IDs (Happy Families / Proposal 321) for '
+             'family-conflict checks, on top of the family-cert entries '
+             'already read from server descriptors regardless of this '
+             'setting (see RouterStatusEntry.family_ids in pathsim.py). '
+             'Since microdescriptors are only re-published when their '
+             'content changes, this source alone usually needs to cover a '
+             'much wider date range than --in_dir/--out_dir to add much - '
+             'check the family ID coverage summary printed at the end of '
+             'this command. If omitted, family_ids still gets populated '
+             'from server descriptors\' family-cert entries; you just '
+             'lose whatever extra coverage the microdescriptor family-ids '
+             'line would add on top.')
 
 
     simulate_parser = subparsers.add_parser('simulate',
@@ -1747,7 +2348,7 @@ pathsim, and pickle it. The pickled object is input to the simulate command')
                 month += 1
             month = 1
         process_consensuses.process_consensuses(in_dirs, args.fat,
-            args.initial_descriptor_dir)
+            args.initial_descriptor_dir, args.microdescs_dir)
     elif (args.subparser == 'simulate'):
         logging.basicConfig(stream=sys.stdout, level=getattr(logging,
             args.loglevel))    
