@@ -1922,7 +1922,7 @@ def create_conflux_set(cons_rel_stats, cons_valid_after, cons_fresh_until,
     return conflux_set
 
 def create_circuits(network_states, streams, num_samples, congmodel,
-    pdelmodel, callbacks=None):
+    pdelmodel, callbacks=None, shared_guards=False):
     """Takes streams over time and creates circuits by interaction
     with create_circuit().
       Input:
@@ -1931,7 +1931,7 @@ def create_circuits(network_states, streams, num_samples, congmodel,
             indicating most recent status should be repeated with consensus
             valid/fresh times advanced 60 minutes
         streams: *ordered* list of streams, where a stream is a dict with keys
-            'time': timestamp of when stream request occurs 
+            'time': timestamp of when stream request occurs
             'type': 'connect' for SOCKS CONNECT, 'resolve' for SOCKS RESOLVE
             'ip': IP address of destination
             'port': desired TCP port
@@ -1939,6 +1939,11 @@ def create_circuits(network_states, streams, num_samples, congmodel,
         congmodel: (CongestionModel) outputs congestion used by some path algs
         pdelmodel: (PropagationDelayModel) outputs prop delay
         callbacks: obj providing callback interface, cf. event_callbacks module
+        shared_guards: (bool) if True, all num_samples client states replaying
+            these streams pull from a single shared GuardSelectionState
+            (modeling num_samples concurrent circuits of one real client)
+            instead of each sample getting its own independent guard list
+            (modeling num_samples separate, unrelated clients).
     Output:
         Uses callbacks to produce any desired output.
     """
@@ -1963,15 +1968,21 @@ def create_circuits(network_states, streams, num_samples, congmodel,
 
     # client states for each sample
     client_states = []
+    # if shared_guards, all num_samples samples are concurrent circuits of
+    # the *same* client and draw from one guard list; otherwise each sample
+    # is an independent client with its own guard list
+    common_guards = guard_selection_271.GuardSelectionState() if shared_guards\
+        else None
     for i in range(num_samples):
         # guard is now not a plain dict but a GuardSelectionState instance
         # from guard_selection_271.py - holds the SAMPLED/FILTERED/PRIMARY
         # hierarchy and confirmed order (Proposal 271)
-        # port_needs are ports that must be covered by existing circuits        
+        # port_needs are ports that must be covered by existing circuits
         # circuit vars are ordered by increasing time since create or dirty
         port_needs_covered = {}
         client_states.append({'id':i,
-                            'guards':guard_selection_271.GuardSelectionState(),
+                            'guards':(common_guards if shared_guards else\
+                                guard_selection_271.GuardSelectionState()),
                             'port_needs_covered':port_needs_covered,
                             'clean_exit_circuits':collections.deque(),
                             'dirty_exit_circuits':collections.deque(),
@@ -2251,6 +2262,12 @@ directories are located')
         help='stores the network state files to use')
     simulate_parser.add_argument('--num_samples', type=int, default=1,
         help='number of simulations to execute')
+    simulate_parser.add_argument('--shared_guards', action='store_true',
+        help='if set, the num_samples circuit-building slots for a given '
+             'client/stream share a single guard list (modeling num_samples '
+             'concurrent circuits of one real client) instead of each '
+             'getting its own independent guard list (the default, modeling '
+             'num_samples separate, unrelated clients)')
     simulate_parser.add_argument('--trace_file', default="in/users2-processed.traces.pickle",
         help='name of files containing the user traces')
     simulate_parser.add_argument('--user_model', default='simple=600',
@@ -2454,10 +2471,10 @@ pathsim, and pickle it. The pickled object is input to the simulate command')
             network_states_list = list(network_states)
             for model_name, model_streams in streams.items():
                 create_circuits(iter(network_states_list), model_streams, args.num_samples,
-                    congmodel, pdelmodel, callbacks)
+                    congmodel, pdelmodel, callbacks, shared_guards=args.shared_guards)
         else:
             create_circuits(network_states, streams, args.num_samples, congmodel,
-                pdelmodel, callbacks)
+                pdelmodel, callbacks, shared_guards=args.shared_guards)
     elif (args.subparser == 'concattraces'):
         ut = UserTraces(args.facebook_filename, args.gmailchat_filename,
             args.gcalgdocs_filename, args.websearch_filename,
