@@ -1,4 +1,4 @@
-0name: torps
+name: torps
 channels:
   - conda-forge
   - defaults
