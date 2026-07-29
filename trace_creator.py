@@ -110,7 +110,7 @@ sys.path.insert(0, '.')
 from models import UserTraces
 
 
-DEFAULT_PFX2AS_PATH = 'in/pfx2as.tsv'
+DEFAULT_PFX2AS_PATH = '/scratch/enhance_pairwise/src/torps/network/pfx2_as.tsv'
 
 # Hardcoded per-country circuit-count weights, read off the chat-provided
 # chart (a "Circuits" bar chart by country, top 14 countries with error
@@ -289,7 +289,19 @@ def random_ip_in_networks(entries):
     num_addresses * share, so contested/MOAS prefixes and smaller blocks
     are picked less often - then a random host address within it
     (avoiding network/broadcast addresses when the block is large enough
-    to have them)."""
+    to have them).
+
+    NOTE: this rebuilds the (networks, weights) lists from scratch on
+    every call, which is fine for a handful of calls but becomes a real
+    bottleneck at trace_creator.py's --total scale (hundreds of
+    thousands+), where the same AS - especially a big one with thousands
+    of announced prefixes - gets picked as a destination many times over.
+    Measured: ~460 calls/sec against a 5,000-prefix AS, vs ~6,900 calls/
+    sec via build_ip_sampler()'s cached version below - a ~15x
+    difference that alone can turn into minutes of apparently-frozen
+    silence for a large --total run. main() uses build_ip_sampler() (with
+    per-AS caching) instead of calling this directly in its per-row loop;
+    this function is kept for any single-shot/legacy callers."""
     networks = [net for net, share in entries]
     weights = [net.num_addresses * share for net, share in entries]
     network = random.choices(networks, weights=weights, k=1)[0]
@@ -298,6 +310,27 @@ def random_ip_in_networks(entries):
     else:
         offset = random.randint(1, network.num_addresses - 2)
     return str(ipaddress.ip_address(int(network.network_address) + offset))
+
+
+def build_ip_sampler(entries):
+    """Precomputes the (networks, weights) lists for one AS's prefix
+    entries ONCE, returning a zero-arg callable that draws one random IP
+    from them cheaply on every subsequent call - see the perf note on
+    random_ip_in_networks() above for why this matters. main() keeps one
+    of these per distinct destination AS (built lazily, on first use) and
+    reuses it for every row assigned to that AS."""
+    networks = [net for net, share in entries]
+    weights = [net.num_addresses * share for net, share in entries]
+
+    def _draw():
+        network = random.choices(networks, weights=weights, k=1)[0]
+        if network.num_addresses <= 2:
+            offset = random.randint(0, network.num_addresses - 1)
+        else:
+            offset = random.randint(1, network.num_addresses - 2)
+        return str(ipaddress.ip_address(int(network.network_address) + offset))
+
+    return _draw
 
 
 ### --- Optional: local CAIDA as-org2info.txt for AS -> country --- ###
@@ -523,7 +556,7 @@ def compute_as_density(pfx2as_path, min_prefix_len=8, as_org_path=None,
 
 def main():
     parser = argparse.ArgumentParser(description='Create artificial traces pickle')
-    parser.add_argument('--ports', nargs='+', required=True, metavar='PORT:RATIO',
+    parser.add_argument('--ports', nargs='+', default="80:0.52 1215:0.06 6890:0.2 6991:0.14 25:0.08", metavar='PORT:RATIO',
         help='Port and ratio pairs e.g. 443:70 80:30')
     parser.add_argument('--total', type=int, required=True,
         help='Total number of circuits/users to generate')
@@ -540,7 +573,7 @@ def main():
              'i.e. drop anything shorter than a /8 as a likely default-'
              'route/aggregation artifact rather than real address '
              'ownership - see load_pfx2as() docstring).')
-    parser.add_argument('--as-org-file', default=None,
+    parser.add_argument('--as-org-file', default="/scratch/enhance_pairwise/src/torps/network/as2org/20260501.as-org2info.txt",
         help='Path to a local CAIDA as-org2info.txt (or equivalent) for '
              'AS->country mapping. Optional - enables country-grouped '
              'density (see module docstring for the three '
@@ -586,6 +619,14 @@ def main():
         client_as_list = sample_weighted(as_keys, as_weights, args.total)
         dest_as_list = sample_weighted(as_keys, as_weights, args.total)
 
+    # [perf] One IP sampler per distinct destination AS, built lazily on
+    # first use and reused for every subsequent row assigned to that AS -
+    # see build_ip_sampler()'s docstring for why this matters at scale
+    # (a single big AS picked tens of thousands of times would otherwise
+    # rebuild its weighted network list from scratch every single time).
+    ip_samplers = {}
+    progress_step = max(1, args.total // 20)  # ~20 progress lines total
+
     trace = {}
     for i in range(args.total):
         port = port_list[i]
@@ -595,11 +636,20 @@ def main():
             key += '_AS{}'.format(client_as_list[i])
 
         if dest_as_list is not None:
-            ip = random_ip_in_networks(prefixes[dest_as_list[i]])
+            dest_as = dest_as_list[i]
+            sampler = ip_samplers.get(dest_as)
+            if sampler is None:
+                sampler = build_ip_sampler(prefixes[dest_as])
+                ip_samplers[dest_as] = sampler
+            ip = sampler()
         else:
             ip = random_public_ip()
 
         trace[key] = [(0.0, ip, port)]
+
+        if (i + 1) % progress_step == 0 or (i + 1) == args.total:
+            print('  ...{0}/{1} circuits generated ({2:.0f}%)'.format(
+                i + 1, args.total, 100.0 * (i + 1) / args.total))
 
     ut = UserTraces.from_dict(trace)
     with open(args.out, 'wb') as f:
