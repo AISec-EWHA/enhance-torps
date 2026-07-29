@@ -56,6 +56,12 @@ class PrintStreamAssignments(object):
         self.file = file
         self.descriptors = None
         self.sample_id = None
+        # [client/dest] Identifies which trace-file key (client/session)
+        # is currently being simulated - set once per create_circuits()
+        # call via set_client_id(), e.g. from pathsim.py's --user_model
+        # all loop over trace keys. None if the caller never calls
+        # set_client_id() (fully backwards compatible).
+        self.client_id = None
 
     def start(self):
         """Prints log header for stream lines."""
@@ -66,7 +72,12 @@ class PrintStreamAssignments(object):
         elif (self.format == 'relay-adv'):
             self.file.write('Sample\tTimestamp\tCompromise Code\n')
         elif (self.format == 'network-adv'):
-            self.file.write('Sample\tTimestamp\tGuard Fingerprint\tExit Fingerprint\tDestination IP\tConflux Leg\n')
+            # [client/dest] Guard/Exit are written as IP addresses (not
+            # fingerprints) - see _relay_ip() - so downstream AS-level
+            # analysis can resolve them to an AS via the same pfx2as.tsv
+            # longest-prefix-match already used for Destination IP,
+            # instead of needing a separate fingerprint->AS step.
+            self.file.write('Sample\tClient\tTimestamp\tGuard IP\tExit IP\tDestination IP\tConflux Leg\n')
         else:
             self.file.write('Sample\tTimestamp\tGuard Fingerprint\tMiddle Fingerprint\tExit Fingerprint\tDestination IP\tConflux Leg\n')
 
@@ -77,8 +88,38 @@ class PrintStreamAssignments(object):
     def set_sample_id(self, id):
         self.sample_id = id
 
+    def set_client_id(self, id):
+        """[client/dest] Optional callback, called by create_circuits()
+        (if supported - see hasattr check in pathsim.py) once per trace
+        key/session, so 'network-adv' output rows can identify which
+        client they belong to. id is whatever pathsim.py's caller passes
+        as create_circuits()'s client_id kwarg - with trace_creator.py's
+        --client-as option, this is a string like "circuit42_AS3320", so
+        the client AS is recoverable by splitting on "_AS"."""
+        self.client_id = id
+
     def circuit_creation(self, circuit):
         pass
+
+    def _relay_ip(self, fp):
+        """[client/dest] Resolves a relay fingerprint to its descriptor IP
+        address, for 'network-adv' output. Falls back to the raw
+        fingerprint (with a one-time stderr warning per missing fp) rather
+        than crashing, in case a circuit ever references a relay whose
+        descriptor isn't in self.descriptors - this shouldn't normally
+        happen since path selection only picks relays with a descriptor,
+        but better to flag it than lose the whole simulation run."""
+        desc = self.descriptors.get(fp) if self.descriptors else None
+        if desc is None:
+            if not hasattr(self, '_warned_missing_desc'):
+                self._warned_missing_desc = set()
+            if fp not in self._warned_missing_desc:
+                self._warned_missing_desc.add(fp)
+                sys.stderr.write('WARNING: no descriptor found for relay '
+                    'fingerprint {0}, falling back to writing the '
+                    'fingerprint itself in network-adv output.\n'.format(fp))
+            return fp
+        return desc.address
 
     def stream_assignment(self, stream, circuit):
         """Writes log line(s) to file (default stdout) showing client, time, IPs, and
@@ -92,6 +133,9 @@ class PrintStreamAssignments(object):
         if (circuit is None):
             if (self.format == 'testing'):
                 pass
+            elif (self.format == 'network-adv'):
+                self.file.write('{0}\t{1}\t{2}\n'.format(
+                    self.sample_id, self.client_id, stream['time']))
             else:
                 self.file.write('{0}\t{1}\n'.format(self.sample_id, stream['time']))
             return
@@ -132,9 +176,11 @@ class PrintStreamAssignments(object):
         elif (self.format == 'network-adv'):
             for (guard_fp, middle_fp, exit_fp, leg_index) in _iter_circuit_rows(circuit):
                 leg_str = '' if leg_index is None else str(leg_index)
-                self.file.write('{0}\t{1}\t{2}\t{3}\t{4}\t{5}\n'.format(
-                    self.sample_id, stream['time'], guard_fp, exit_fp,
-                    dest_ip, leg_str))
+                guard_ip = self._relay_ip(guard_fp)
+                exit_ip = self._relay_ip(exit_fp)
+                self.file.write('{0}\t{1}\t{2}\t{3}\t{4}\t{5}\t{6}\n'.format(
+                    self.sample_id, self.client_id, stream['time'], guard_ip,
+                    exit_ip, dest_ip, leg_str))
         else:
             for (guard_fp, middle_fp, exit_fp, leg_index) in _iter_circuit_rows(circuit):
                 leg_str = '' if leg_index is None else str(leg_index)
