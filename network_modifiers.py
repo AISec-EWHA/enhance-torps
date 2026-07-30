@@ -6,6 +6,13 @@ import pathsim
 
 class Enum(tuple): __getattr__ = tuple.index
 
+# exit policies available for adversarial exits via --adv_exit_policy
+ADV_EXIT_POLICIES = {
+    'all': ('accept *:*',),
+    'web': ('accept *:80', 'accept *:443', 'reject *:*'),
+    'non-web': ('reject *:80', 'reject *:443', 'accept *:*'),
+}
+
 ### Class inserting adversary relays ###
 class AdversaryInsertion(object):
 
@@ -38,8 +45,9 @@ class AdversaryInsertion(object):
                 ntor_onion_key)
 
 
-    def add_adv_exits(self, num_adv_guards, num_adv_exits, bandwidth):
+    def add_adv_exits(self, num_adv_guards, num_adv_exits, bandwidth, exit_policy_name):
         """"Adds adv exits into self.add_relays and self.add_descriptors."""
+        exit_policy_rules = ADV_EXIT_POLICIES[exit_policy_name]
         for i in xrange(num_adv_exits):
             # create consensus
             num_str = str(i+1)
@@ -60,7 +68,7 @@ class AdversaryInsertion(object):
             hibernating = False
             family = {}
             address = '10.'+str(num_adv_guards+i+1)+'.0.0' # avoid /16 conflicts
-            exit_policy = ExitPolicy('accept *:*')
+            exit_policy = ExitPolicy(*exit_policy_rules)
             ntor_onion_key = num_str # indicate ntor support w/ val != None
             self.adv_descriptors[fingerprint] = pathsim.ServerDescriptor(fingerprint,
                 hibernating, nickname, family, address, exit_policy,
@@ -307,12 +315,12 @@ class AdversaryInsertion(object):
 
 
     def __init__(self, adv_time, num_adv_guards, adv_guard_cons_bw, num_adv_exits, adv_exit_cons_bw,
-        testing):
+        testing, adv_exit_policy='all'):
         self.adv_time = adv_time
         self.adv_relays = {}
         self.adv_descriptors = {}
         self.add_adv_guards(num_adv_guards, adv_guard_cons_bw)
-        self.add_adv_exits(num_adv_guards, num_adv_exits, adv_exit_cons_bw)
+        self.add_adv_exits(num_adv_guards, num_adv_exits, adv_exit_cons_bw, adv_exit_policy)
         self.testing = testing
         self.first_modification = True
         self.bww_errors = Enum(("NO_ERROR","SUMG_ERROR", "SUME_ERROR",

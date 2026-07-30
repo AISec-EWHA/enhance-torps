@@ -2300,6 +2300,11 @@ consensuses')
         help='indicates the number of adversarial guards to add')
     simulate_parser.add_argument('--num_adv_exits', type=int, default=0,
         help='indicates the number of adversarial exits to add')
+    simulate_parser.add_argument('--adv_exit_policy', choices=['all', 'web', 'non-web'],
+        default='all',
+        help='exit policy for adversarial exits: "all" accepts all ports \
+(default), "web" accepts only ports 80/443, "non-web" accepts all ports \
+except 80/443')
     simulate_parser.add_argument('--other_network_modifier', default=None,
         help='class to modify network, argument syntax: module.class-argstring')
     simulate_parser.add_argument('--num_guards', type=int, default=1,
@@ -2411,7 +2416,7 @@ pathsim, and pickle it. The pickled object is input to the simulate command')
         # create object that will add adversarial relays into network
         adv_insertion = network_modifiers.AdversaryInsertion(args.adv_time,
             args.num_adv_guards, args.adv_guard_cons_bw, args.num_adv_exits,
-            args.adv_exit_cons_bw, _testing)
+            args.adv_exit_cons_bw, _testing, args.adv_exit_policy)
         network_modifiers = [adv_insertion]
         # create other network modification object
         if (args.other_network_modifier is not None):
