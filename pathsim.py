@@ -1922,7 +1922,7 @@ def create_conflux_set(cons_rel_stats, cons_valid_after, cons_fresh_until,
     return conflux_set
 
 def create_circuits(network_states, streams, num_samples, congmodel,
-    pdelmodel, callbacks=None, shared_guards=False):
+    pdelmodel, callbacks=None, shared_guards=False, client_id=None):
     """Takes streams over time and creates circuits by interaction
     with create_circuit().
       Input:
@@ -1944,9 +1944,19 @@ def create_circuits(network_states, streams, num_samples, congmodel,
             (modeling num_samples concurrent circuits of one real client)
             instead of each sample getting its own independent guard list
             (modeling num_samples separate, unrelated clients).
+        client_id: [client/dest] identifies which trace-file key/session
+            these streams came from (e.g. the "circuit42_AS3320" key
+            produced by trace_creator.py's --client-as option). Passed to
+            callbacks.set_client_id() once, if the callbacks object
+            defines that method (optional, for backwards compatibility
+            with callback classes that don't - same pattern as the
+            conflux_set_creation hasattr check below). None by default,
+            matching the previous (no client identification) behavior.
     Output:
         Uses callbacks to produce any desired output.
     """
+    if (callbacks is not None) and hasattr(callbacks, 'set_client_id'):
+        callbacks.set_client_id(client_id)
     
     ### Simulation variables ###
     cur_period_start = None
@@ -2290,6 +2300,11 @@ consensuses')
         help='indicates the number of adversarial guards to add')
     simulate_parser.add_argument('--num_adv_exits', type=int, default=0,
         help='indicates the number of adversarial exits to add')
+    simulate_parser.add_argument('--adv_exit_policy', choices=['all', 'web', 'non-web'],
+        default='all',
+        help='exit policy for adversarial exits: "all" accepts all ports \
+(default), "web" accepts only ports 80/443, "non-web" accepts all ports \
+except 80/443')
     simulate_parser.add_argument('--other_network_modifier', default=None,
         help='class to modify network, argument syntax: module.class-argstring')
     simulate_parser.add_argument('--num_guards', type=int, default=1,
@@ -2401,7 +2416,7 @@ pathsim, and pickle it. The pickled object is input to the simulate command')
         # create object that will add adversarial relays into network
         adv_insertion = network_modifiers.AdversaryInsertion(args.adv_time,
             args.num_adv_guards, args.adv_guard_cons_bw, args.num_adv_exits,
-            args.adv_exit_cons_bw, _testing)
+            args.adv_exit_cons_bw, _testing, args.adv_exit_policy)
         network_modifiers = [adv_insertion]
         # create other network modification object
         if (args.other_network_modifier is not None):
@@ -2467,14 +2482,32 @@ pathsim, and pickle it. The pickled object is input to the simulate command')
         callbacks.start()
 
         # simulate circuit creation and stream assignment
+        # [client/dest] client_id is passed through so callbacks (e.g.
+        # PrintStreamAssignments' 'network-adv' format) can report which
+        # trace-file key/session each row came from. Wrapped in
+        # try/except TypeError because --pathalg vcs substitutes
+        # create_circuits with vcs_pathsim.create_circuits, which may not
+        # accept this newer kwarg - falls back to the old call shape.
         if isinstance(streams, dict):
             network_states_list = list(network_states)
             for model_name, model_streams in streams.items():
-                create_circuits(iter(network_states_list), model_streams, args.num_samples,
-                    congmodel, pdelmodel, callbacks, shared_guards=args.shared_guards)
+                try:
+                    create_circuits(iter(network_states_list), model_streams,
+                        args.num_samples, congmodel, pdelmodel, callbacks,
+                        shared_guards=args.shared_guards, client_id=model_name)
+                except TypeError:
+                    create_circuits(iter(network_states_list), model_streams,
+                        args.num_samples, congmodel, pdelmodel, callbacks,
+                        shared_guards=args.shared_guards)
         else:
-            create_circuits(network_states, streams, args.num_samples, congmodel,
-                pdelmodel, callbacks, shared_guards=args.shared_guards)
+            try:
+                create_circuits(network_states, streams, args.num_samples,
+                    congmodel, pdelmodel, callbacks,
+                    shared_guards=args.shared_guards, client_id=args.user_model)
+            except TypeError:
+                create_circuits(network_states, streams, args.num_samples,
+                    congmodel, pdelmodel, callbacks,
+                    shared_guards=args.shared_guards)
     elif (args.subparser == 'concattraces'):
         ut = UserTraces(args.facebook_filename, args.gmailchat_filename,
             args.gcalgdocs_filename, args.websearch_filename,
