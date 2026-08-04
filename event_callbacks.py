@@ -9,12 +9,34 @@
 ###
 
 import sys
+import re
 
 # [B6] Adversary fingerprint prefixes used by network_modifiers.AdversaryInsertion
 # (add_adv_guards()/add_adv_exits()) - reused here to detect compromised nodes
 # without importing that module.
 _ADV_GUARD_PREFIX = '000000000000000000000000000000'
 _ADV_EXIT_PREFIX = 'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+
+# [client/dest] Matches the "_AS<client_as>" / "_AS<client_as>_DAS<dest_as>"
+# suffix trace_creator.py appends to trace-file keys, e.g.
+# "circuit42_AS3320_DAS7922" -> source_as='3320', dest_as='7922'. The
+# _DAS group is optional so this still matches older trace files (or
+# --no-as-density ones without a client AS at all, where it just won't
+# match).
+_CLIENT_ID_AS_RE = re.compile(r'_AS(\d+)(?:_DAS(\d+))?$')
+
+
+def _parse_client_as(client_id):
+    """[client/dest] Extracts (source_as, dest_as) strings from a
+    trace-file key produced by trace_creator.py. Returns ('', '') for
+    client_id values that don't carry AS info (None, or a key from
+    --no-as-density / before the _DAS destination-AS suffix existed)."""
+    if not client_id:
+        return '', ''
+    m = _CLIENT_ID_AS_RE.search(client_id)
+    if not m:
+        return '', ''
+    return m.group(1), (m.group(2) or '')
 
 
 def _iter_circuit_rows(circuit):
@@ -76,8 +98,11 @@ class PrintStreamAssignments(object):
             # fingerprints) - see _relay_ip() - so downstream AS-level
             # analysis can resolve them to an AS via the same pfx2as.tsv
             # longest-prefix-match already used for Destination IP,
-            # instead of needing a separate fingerprint->AS step.
-            self.file.write('Sample\tClient\tTimestamp\tGuard IP\tExit IP\tDestination IP\tConflux Leg\n')
+            # instead of needing a separate fingerprint->AS step. Source
+            # AS/Destination AS are parsed straight out of the Client
+            # key (see _parse_client_as()) rather than needing a
+            # pfx2as lookup themselves.
+            self.file.write('Sample\tClient\tSource AS\tDestination AS\tTimestamp\tGuard IP\tExit IP\tDestination IP\tConflux Leg\n')
         else:
             self.file.write('Sample\tTimestamp\tGuard Fingerprint\tMiddle Fingerprint\tExit Fingerprint\tDestination IP\tConflux Leg\n')
 
@@ -94,8 +119,9 @@ class PrintStreamAssignments(object):
         key/session, so 'network-adv' output rows can identify which
         client they belong to. id is whatever pathsim.py's caller passes
         as create_circuits()'s client_id kwarg - with trace_creator.py's
-        --client-as option, this is a string like "circuit42_AS3320", so
-        the client AS is recoverable by splitting on "_AS"."""
+        AS-density assignment (the default, unless --no-as-density is
+        given), this is a string like "circuit42_AS3320_DAS7922", so the
+        client/destination AS are recoverable via _parse_client_as()."""
         self.client_id = id
 
     def circuit_creation(self, circuit):
@@ -134,8 +160,10 @@ class PrintStreamAssignments(object):
             if (self.format == 'testing'):
                 pass
             elif (self.format == 'network-adv'):
-                self.file.write('{0}\t{1}\t{2}\n'.format(
-                    self.sample_id, self.client_id, stream['time']))
+                source_as, dest_as = _parse_client_as(self.client_id)
+                self.file.write('{0}\t{1}\t{2}\t{3}\t{4}\n'.format(
+                    self.sample_id, self.client_id, source_as, dest_as,
+                    stream['time']))
             else:
                 self.file.write('{0}\t{1}\n'.format(self.sample_id, stream['time']))
             return
@@ -174,13 +202,14 @@ class PrintStreamAssignments(object):
             self.file.write('{0}\t{1}\t{2}\n'.format(self.sample_id, stream['time'],
                 compromise_code))
         elif (self.format == 'network-adv'):
+            source_as, dest_as = _parse_client_as(self.client_id)
             for (guard_fp, middle_fp, exit_fp, leg_index) in _iter_circuit_rows(circuit):
                 leg_str = '' if leg_index is None else str(leg_index)
                 guard_ip = self._relay_ip(guard_fp)
                 exit_ip = self._relay_ip(exit_fp)
-                self.file.write('{0}\t{1}\t{2}\t{3}\t{4}\t{5}\t{6}\n'.format(
-                    self.sample_id, self.client_id, stream['time'], guard_ip,
-                    exit_ip, dest_ip, leg_str))
+                self.file.write('{0}\t{1}\t{2}\t{3}\t{4}\t{5}\t{6}\t{7}\t{8}\n'.format(
+                    self.sample_id, self.client_id, source_as, dest_as,
+                    stream['time'], guard_ip, exit_ip, dest_ip, leg_str))
         else:
             for (guard_fp, middle_fp, exit_fp, leg_index) in _iter_circuit_rows(circuit):
                 leg_str = '' if leg_index is None else str(leg_index)
