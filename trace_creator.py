@@ -13,6 +13,12 @@ principle symmetrically to both ends of the circuit, computed entirely
 from local files. No network access at runtime, ever - everything below
 reads from disk.
 
+Both ASes are encoded directly in the trace key, e.g.
+"circuit42_AS3320_DAS7922" (client AS 3320, destination AS 7922) - the
+destination IP alone doesn't round-trip back to an AS without redoing
+a pfx2as lookup, so the sampled destination AS is stashed in the key
+right alongside the client AS instead of being thrown away.
+
 This implements CLAPS's own density formula (Rochet et al., CCS 2020,
 Sec. 6: "we take Tor's measured user-per-country statistics and
 distribute users into ASes within their country proportional to the
@@ -110,7 +116,7 @@ sys.path.insert(0, '.')
 from models import UserTraces
 
 
-DEFAULT_PFX2AS_PATH = '/scratch/enhance_pairwise/src/torps/network/pfx2_as.tsv'
+DEFAULT_PFX2AS_PATH = '/data1/enhance-pairwise/src/torps/network/network/pfx2_as.tsv'
 
 # Hardcoded per-country circuit-count weights, read off the chat-provided
 # chart (a "Circuits" bar chart by country, top 14 countries with error
@@ -556,7 +562,7 @@ def compute_as_density(pfx2as_path, min_prefix_len=8, as_org_path=None,
 
 def main():
     parser = argparse.ArgumentParser(description='Create artificial traces pickle')
-    parser.add_argument('--ports', nargs='+', default="80:0.52 1215:0.06 6890:0.2 6991:0.14 25:0.08", metavar='PORT:RATIO',
+    parser.add_argument('--ports', nargs='+', default=["80:0.52", "1215:0.06", "6890:0.2", "6991:0.14", "25:0.08"], metavar='PORT:RATIO',
         help='Port and ratio pairs e.g. 443:70 80:30')
     parser.add_argument('--total', type=int, required=True,
         help='Total number of circuits/users to generate')
@@ -573,7 +579,7 @@ def main():
              'i.e. drop anything shorter than a /8 as a likely default-'
              'route/aggregation artifact rather than real address '
              'ownership - see load_pfx2as() docstring).')
-    parser.add_argument('--as-org-file', default="/scratch/enhance_pairwise/src/torps/network/as2org/20260501.as-org2info.txt",
+    parser.add_argument('--as-org-file', default="/data1/enhance-pairwise/src/torps/network/network/as2org/20260501.as-org2info.txt",
         help='Path to a local CAIDA as-org2info.txt (or equivalent) for '
              'AS->country mapping. Optional - enables country-grouped '
              'density (see module docstring for the three '
@@ -642,6 +648,7 @@ def main():
                 sampler = build_ip_sampler(prefixes[dest_as])
                 ip_samplers[dest_as] = sampler
             ip = sampler()
+            key += '_DAS{}'.format(dest_as)
         else:
             ip = random_public_ip()
 
