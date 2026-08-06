@@ -16,7 +16,7 @@ ADV_EXIT_POLICIES = {
 ### Class inserting adversary relays ###
 class AdversaryInsertion(object):
 
-    def add_adv_guards(self, num_adv_guards, bandwidth):
+    def add_adv_guards(self, num_adv_guards, bandwidth, supports_conflux=False):
         """"Adds adv guards into self.add_relays and self.add_descriptors."""
         #, adv_relays, adv_descriptors
         for i in xrange(num_adv_guards):
@@ -32,7 +32,7 @@ class AdversaryInsertion(object):
             flags = [Flag.FAST, Flag.GUARD, Flag.RUNNING, Flag.STABLE,
                 Flag.VALID, Flag.V2DIR]
             self.adv_relays[fingerprint] = pathsim.RouterStatusEntry(fingerprint,
-                nickname, flags, bandwidth)
+                nickname, flags, bandwidth, supports_conflux=supports_conflux)
             
             # create descriptor
             hibernating = False
@@ -45,7 +45,8 @@ class AdversaryInsertion(object):
                 ntor_onion_key)
 
 
-    def add_adv_exits(self, num_adv_guards, num_adv_exits, bandwidth, exit_policy_name):
+    def add_adv_exits(self, num_adv_guards, num_adv_exits, bandwidth, exit_policy_name,
+        supports_conflux=False):
         """"Adds adv exits into self.add_relays and self.add_descriptors."""
         exit_policy_rules = ADV_EXIT_POLICIES[exit_policy_name]
         for i in xrange(num_adv_exits):
@@ -62,7 +63,7 @@ class AdversaryInsertion(object):
             flags = [Flag.FAST, Flag.EXIT, Flag.RUNNING, Flag.STABLE,
                 Flag.VALID]
             self.adv_relays[fingerprint] = pathsim.RouterStatusEntry(fingerprint,
-                nickname, flags, bandwidth)
+                nickname, flags, bandwidth, supports_conflux=supports_conflux)
             
             # create descriptor
             hibernating = False
@@ -315,12 +316,14 @@ class AdversaryInsertion(object):
 
 
     def __init__(self, adv_time, num_adv_guards, adv_guard_cons_bw, num_adv_exits, adv_exit_cons_bw,
-        testing, adv_exit_policy='all'):
+        testing, adv_exit_policy='all', adv_supports_conflux=False):
         self.adv_time = adv_time
         self.adv_relays = {}
         self.adv_descriptors = {}
-        self.add_adv_guards(num_adv_guards, adv_guard_cons_bw)
-        self.add_adv_exits(num_adv_guards, num_adv_exits, adv_exit_cons_bw, adv_exit_policy)
+        self.add_adv_guards(num_adv_guards, adv_guard_cons_bw,
+            supports_conflux=adv_supports_conflux)
+        self.add_adv_exits(num_adv_guards, num_adv_exits, adv_exit_cons_bw, adv_exit_policy,
+            supports_conflux=adv_supports_conflux)
         self.testing = testing
         self.first_modification = True
         self.bww_errors = Enum(("NO_ERROR","SUMG_ERROR", "SUME_ERROR",

@@ -11,3 +11,5 @@ tmp/
 analysis/
 old-analysis/
 network/
+*.png
+CLAUDE.md
