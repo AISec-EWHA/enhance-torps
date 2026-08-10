@@ -104,7 +104,7 @@ class PrintStreamAssignments(object):
             # pfx2as lookup themselves.
             self.file.write('Sample\tClient\tSource AS\tDestination AS\tTimestamp\tGuard IP\tExit IP\tDestination IP\tConflux Leg\n')
         else:
-            self.file.write('Sample\tTimestamp\tGuard Fingerprint\tMiddle Fingerprint\tExit Fingerprint\tDestination IP\tConflux Leg\n')
+            self.file.write('Sample\tTimestamp\tGuard Fingerprint\tMiddle Fingerprint\tExit Fingerprint\tDestination IP\tDestination Port\tConflux Leg\n')
 
     def set_network_state(self, cons_valid_after, cons_fresh_until, cons_bw_weights,
         cons_bwweightscale, cons_rel_stats, descriptors):
@@ -165,7 +165,8 @@ class PrintStreamAssignments(object):
                     self.sample_id, self.client_id, source_as, dest_as,
                     stream['time']))
             else:
-                self.file.write('{0}\t{1}\n'.format(self.sample_id, stream['time']))
+                self.file.write('{0}\t{1}\t{2}\n'.format(self.sample_id, stream['time'],
+                    stream['port']))
             return
 
         if (stream['type'] == 'connect'):
@@ -213,9 +214,9 @@ class PrintStreamAssignments(object):
         else:
             for (guard_fp, middle_fp, exit_fp, leg_index) in _iter_circuit_rows(circuit):
                 leg_str = '' if leg_index is None else str(leg_index)
-                self.file.write('{0}\t{1}\t{2}\t{3}\t{4}\t{5}\t{6}\n'.format(
+                self.file.write('{0}\t{1}\t{2}\t{3}\t{4}\t{5}\t{6}\t{7}\n'.format(
                     self.sample_id, stream['time'], guard_fp, middle_fp,
-                    exit_fp, dest_ip, leg_str))
+                    exit_fp, dest_ip, stream['port'], leg_str))
 ######
 
 ### Print relay compromised codes of stream assignments, compromise from input adv relays. ###
