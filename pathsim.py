@@ -1165,6 +1165,12 @@ def timed_client_updates(cur_time, client_state, port_needs_global,
     # these speculatively (not tied to a specific port/stream need), so we
     # don't gate this on port_needs_global the way ordinary clean circuits
     # are - it just tries to keep the pool topped up.
+    # [B6 FIX] This per-tick refill (once per time_step, e.g. every 60s)
+    # catches gaps from expiry (circuit_idle_timeout) between ticks.
+    # client_assign_stream() *also* now does an immediate top-up right
+    # after a stream consumes from the pool, which is what actually
+    # closes the gap with real Tor's once-per-second refill cadence -
+    # this per-tick pass alone was not frequent enough on its own.
     if TorOptions.cfx_enabled:
         max_prebuilt = get_max_prebuilt_conflux_sets(exit_conflux_ratio)
         while len(client_state['clean_conflux_sets']) < max_prebuilt:
@@ -1407,40 +1413,132 @@ def client_assign_stream(client_state, stream, cons_rel_stats,
     cons_valid_after, cons_fresh_until, cons_bw_weights, cons_bwweightscale,
     descriptors, hibernating_status, stream_weighted_exits,
     weighted_middles, weighted_guards, congmodel, pdelmodel, callbacks=None,
-    conflux_stats=None):
+    conflux_stats=None, exit_conflux_ratio=0.0):
     """Assigns a stream to a circuit for a given client.
     conflux_stats: [B6] optional dict with keys 'sets_used_for_stream' and
     'single_circuits_used_for_stream', incremented here so callers can
     report how much traffic actually ended up using conflux vs. plain
     single circuits (see the summary printed at the end of
-    create_circuits())."""
+    create_circuits()).
+    exit_conflux_ratio: [B6 FIX] needed here (not just in
+    timed_client_updates()) to immediately top the prebuilt conflux pool
+    back up right after a stream consumes from it, rather than waiting
+    for the next timed_client_updates() call (up to time_step seconds
+    later). Real Tor rechecks/refills the pool every second
+    (circuit_build_needed_circs(), confirmed against circuituse.c); our
+    simulation only ticks once per time_step (typically 60s), so without
+    this immediate top-up, a pool that gets drained partway through a
+    tick would incorrectly stay empty for the rest of that tick."""
         
     guards = client_state['guards']
     stream_assigned = None
 
+    # [B6 FIX] Real Tor's circuit_get_best() checks prebuilt conflux
+    # circuits FIRST, before scanning the regular circuit list at all:
+    #   "Prefer pre-built conflux circuits here, if available but only
+    #   for general purposes." (circuituse.c circuit_get_best(), confirmed
+    #   against the real source - this file previously had the priority
+    #   inverted, checking regular circuits before conflux, which
+    #   artificially starved conflux of streams that regular dirty/clean
+    #   circuits would otherwise have soaked up first.)
+
+    # try to reuse a dirty conflux set
+    if TorOptions.cfx_enabled:
+        for conflux_set in client_state['dirty_conflux_sets']:
+            if (conflux_set['dirty_time'] > \
+                    stream['time'] - TorOptions.max_circuit_dirtiness) and\
+                conflux_set_supports_stream(conflux_set, stream, descriptors):
+                stream_assigned = conflux_set
+                if conflux_stats is not None:
+                    conflux_stats['sets_used_for_stream'] += 1
+                if _testing:
+                    print('Assigned stream to dirty conflux set at {0}'.
+                        format(stream['time']))
+                break
+
+    # next try to promote a clean (prebuilt) conflux set
+    if (stream_assigned == None) and TorOptions.cfx_enabled:
+        new_clean_conflux_sets = collections.deque()
+        while (len(client_state['clean_conflux_sets']) > 0):
+            conflux_set = client_state['clean_conflux_sets'].popleft()
+            if (stream_assigned == None) and\
+                conflux_set_supports_stream(conflux_set, stream, descriptors):
+                stream_assigned = conflux_set
+                conflux_set['dirty_time'] = stream['time']
+                client_state['dirty_conflux_sets'].appendleft(conflux_set)
+                if conflux_stats is not None:
+                    conflux_stats['sets_used_for_stream'] += 1
+                if _testing:
+                    print('Assigned stream to clean (prebuilt) conflux '
+                        'set at {0}'.format(stream['time']))
+            else:
+                new_clean_conflux_sets.append(conflux_set)
+        client_state['clean_conflux_sets'] = new_clean_conflux_sets
+
+        # [B6 FIX] immediately top the pool back up to
+        # max_prebuilt, rather than waiting for the next
+        # timed_client_updates() tick (see docstring above). This
+        # closes the gap with real Tor's once-per-second refill cadence.
+        #
+        # IMPORTANT: only do this once per distinct stream['time'] value
+        # (i.e. once per simulated second) per client, NOT once per
+        # stream. Real Tor's refill is an independent once-a-second
+        # heartbeat - if several streams arrive within the same second
+        # (e.g. a page loading several resources near-simultaneously),
+        # they compete for the SAME not-yet-refilled pool, and only the
+        # first max_prebuilt of them get a conflux set; the rest fall
+        # back to an ordinary circuit, same as they would in real Tor.
+        # Without this guard, refilling synchronously after every single
+        # stream effectively gives each stream its own private "second",
+        # so the pool is never actually seen empty - which is why this
+        # fix initially caused *nearly all* traffic to use conflux
+        # instead of the modest increase we expected.
+        if client_state['conflux_last_refill_time'] != stream['time']:
+            client_state['conflux_last_refill_time'] = stream['time']
+            max_prebuilt = get_max_prebuilt_conflux_sets(exit_conflux_ratio)
+            while len(client_state['clean_conflux_sets']) < max_prebuilt:
+                try:
+                    new_set = create_conflux_set(cons_rel_stats,
+                        cons_valid_after, cons_fresh_until, cons_bw_weights,
+                        cons_bwweightscale, descriptors, hibernating_status,
+                        client_state['guards'], stream['time'], True, False,
+                        congmodel, pdelmodel, callbacks)
+                except ValueError:
+                    # Not enough distinct usable nodes right now - stop
+                    # trying rather than looping forever.
+                    break
+                client_state['clean_conflux_sets'].appendleft(new_set)
+                if conflux_stats is not None:
+                    conflux_stats['sets_created'] += 1
+                if _testing:
+                    print('[B6 FIX] Refilled conflux pool at new second '
+                        '{0}.'.format(stream['time']))
+
     # try to use a dirty circuit
-    for circuit in client_state['dirty_exit_circuits']:
-        if (circuit['dirty_time'] > \
-                stream['time'] - TorOptions.max_circuit_dirtiness) and\
-            circuit_supports_stream(circuit, stream, descriptors):
-            stream_assigned = circuit
-            if _testing:                                
-                if (stream['type'] == 'connect'):
-                    print('Assigned CONNECT stream to port {0} to \
+    if (stream_assigned == None):
+        for circuit in client_state['dirty_exit_circuits']:
+            if (circuit['dirty_time'] > \
+                    stream['time'] - TorOptions.max_circuit_dirtiness) and\
+                circuit_supports_stream(circuit, stream, descriptors):
+                stream_assigned = circuit
+                if _testing:                                
+                    if (stream['type'] == 'connect'):
+                        print('Assigned CONNECT stream to port {0} to \
 dirty circuit at {1}'.format(stream['port'], stream['time']))
-                elif (stream['type'] == 'resolve'):
-                    print('Assigned RESOLVE stream to dirty circuit \
+                    elif (stream['type'] == 'resolve'):
+                        print('Assigned RESOLVE stream to dirty circuit \
 at {0}'.format(stream['time']))
-                else:
-                    print('Assigned unrecognized stream to dirty circuit \
+                    else:
+                        print('Assigned unrecognized stream to dirty circuit \
 at {0}'.format(stream['time']))                                   
-            break        
+                break        
     # next try and use a clean circuit
     if (stream_assigned == None):
         new_clean_exit_circuits = collections.deque()
         while (len(client_state['clean_exit_circuits']) > 0):
             circuit = client_state['clean_exit_circuits'].popleft()
-            if (circuit_supports_stream(circuit, stream, descriptors)):
+            if (stream_assigned == None) and\
+                (circuit_supports_stream(circuit, stream, descriptors)):
                 stream_assigned = circuit
                 circuit['dirty_time'] = stream['time']
                 client_state['dirty_exit_circuits'].appendleft(circuit)
@@ -1465,39 +1563,6 @@ at {0}'.format(stream['time']))
                 new_clean_exit_circuits.append(circuit)
         client_state['clean_exit_circuits'] =\
             new_clean_exit_circuits
-
-    # [B6] next try to reuse a dirty conflux set
-    if (stream_assigned == None) and TorOptions.cfx_enabled:
-        for conflux_set in client_state['dirty_conflux_sets']:
-            if (conflux_set['dirty_time'] > \
-                    stream['time'] - TorOptions.max_circuit_dirtiness) and\
-                conflux_set_supports_stream(conflux_set, stream, descriptors):
-                stream_assigned = conflux_set
-                if conflux_stats is not None:
-                    conflux_stats['sets_used_for_stream'] += 1
-                if _testing:
-                    print('Assigned stream to dirty conflux set at {0}'.
-                        format(stream['time']))
-                break
-
-    # [B6] next try to promote a clean (prebuilt) conflux set
-    if (stream_assigned == None) and TorOptions.cfx_enabled:
-        new_clean_conflux_sets = collections.deque()
-        while (len(client_state['clean_conflux_sets']) > 0):
-            conflux_set = client_state['clean_conflux_sets'].popleft()
-            if (stream_assigned == None) and\
-                conflux_set_supports_stream(conflux_set, stream, descriptors):
-                stream_assigned = conflux_set
-                conflux_set['dirty_time'] = stream['time']
-                client_state['dirty_conflux_sets'].appendleft(conflux_set)
-                if conflux_stats is not None:
-                    conflux_stats['sets_used_for_stream'] += 1
-                if _testing:
-                    print('Assigned stream to clean (prebuilt) conflux '
-                        'set at {0}'.format(stream['time']))
-            else:
-                new_clean_conflux_sets.append(conflux_set)
-        client_state['clean_conflux_sets'] = new_clean_conflux_sets
 
     # if stream still unassigned we must make new circuit
     if (stream_assigned == None):
@@ -1997,7 +2062,14 @@ def create_circuits(network_states, streams, num_samples, congmodel,
                             'clean_exit_circuits':collections.deque(),
                             'dirty_exit_circuits':collections.deque(),
                             'clean_conflux_sets':collections.deque(),
-                            'dirty_conflux_sets':collections.deque()})
+                            'dirty_conflux_sets':collections.deque(),
+                            # [B6 FIX] tracks the last stream 'time' at
+                            # which we did an immediate conflux pool
+                            # top-up in client_assign_stream(), so we
+                            # only refill once per distinct second
+                            # rather than once per stream - see that
+                            # function's docstring.
+                            'conflux_last_refill_time':None})
     ### End simulation variables ###
     
     # run simulation period one network state at a time
@@ -2162,7 +2234,8 @@ def create_circuits(network_states, streams, num_samples, congmodel,
                         descriptors, hibernating_status,
                         stream_port_weighted_exits[stream_port],
                         weighted_middles, weighted_guards,
-                        congmodel, pdelmodel, callbacks, conflux_stats)
+                        congmodel, pdelmodel, callbacks, conflux_stats,
+                        exit_conflux_ratio)
             
             cur_time += time_step
 
